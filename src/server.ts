@@ -109,7 +109,8 @@ export function createVaultServer(options: VaultServerOptions = {}) {
 
   const server = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
     httpRequestsTotal++;
-    const method = (req.method || 'GET').toUpperCase();
+    const rawMethod = (req.method || 'GET').toUpperCase();
+    const method = rawMethod === 'HEAD' ? 'GET' : rawMethod;
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1:8200'}`);
     const pathname = parsedUrl.pathname;
 
