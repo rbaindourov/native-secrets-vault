@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.vault-data/
+*.snap
+*.enc
+*.age
+*.bak*
+.env
+.env.*
+!.env.example
