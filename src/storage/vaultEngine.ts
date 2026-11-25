@@ -459,6 +459,77 @@ export class NativeSecretsVaultEngine {
   }
 
   /**
+   * Mints a time-bounded, strictly isolated browser vault token for a single
+   * authenticated `users_backend` user (`winome/<userId>/*`).
+   * Requires either a `root` token or a `users_backend` broker token whose
+   * `allowedPaths` covers `*` or `winome/*`. Never grants `root` capability.
+   */
+  public mintUserScopedToken(
+    rawBrokerToken: string,
+    userId: string,
+    ttlSeconds = 43200
+  ): {
+    token: string;
+    namespace: string;
+    record: Omit<TokenRecord, 'tokenHash'>;
+  } {
+    const cleanUserId = String(userId || '').trim();
+    if (!/^[a-zA-Z0-9._@-]{1,128}$/.test(cleanUserId) || cleanUserId.includes('..')) {
+      throw new Error('Invalid userId for scoped vault token');
+    }
+
+    const actor = this.authorize(rawBrokerToken, `winome/${cleanUserId}`, 'write');
+    const isAuthorizedBroker =
+      actor.capabilities.includes('root') ||
+      actor.allowedPaths.includes('*') ||
+      actor.allowedPaths.includes('winome/*');
+
+    if (!isAuthorizedBroker) {
+      this.audit.append({
+        actor: actor.name,
+        action: 'token.mint_user_scope',
+        path: `winome/${cleanUserId}/*`,
+        status: 'denied',
+        metadata: { reason: 'not_token_broker' }
+      });
+      throw new Error(
+        `Permission denied: token "${actor.name}" is not authorized to mint user-scoped tokens`
+      );
+    }
+
+    const boundedTtl = Math.max(60, Math.min(ttlSeconds || 43200, 7 * 86400));
+    const newToken = `nsv_usr_${crypto.randomBytes(24).toString('hex')}`;
+    const tHash = hashToken(newToken);
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + boundedTtl * 1000).toISOString();
+    const namespace = `winome/${cleanUserId}`;
+
+    const record: TokenRecord = {
+      id: `utok_${crypto.randomBytes(6).toString('hex')}`,
+      name: `winome-user:${cleanUserId}`,
+      tokenHash: tHash,
+      allowedPaths: [`${namespace}/*`],
+      capabilities: ['read', 'write', 'list', 'delete'],
+      createdAt: now.toISOString(),
+      expiresAt
+    };
+
+    this.state.tokens[tHash] = record;
+    this.saveState();
+
+    this.audit.append({
+      actor: actor.name,
+      action: 'token.mint_user_scope',
+      path: `${namespace}/*`,
+      status: 'success',
+      metadata: { tokenId: record.id, userId: cleanUserId, ttlSeconds: boundedTtl }
+    });
+
+    const { tokenHash: _, ...publicRecord } = record;
+    return { token: newToken, namespace, record: publicRecord };
+  }
+
+  /**
    * Writes a new version of key-value secrets at `secretPath` (KV v2 `put`).
    * By default, merges with existing keys in the previous version unless
    * `options.replaceAll === true` is specified, preventing accidental key loss.
@@ -684,9 +755,50 @@ export class NativeSecretsVaultEngine {
   }
 
   /**
-   * Lists all secret paths matching an optional prefix.
+   * Cryptographically destroys the active version at `secretPath` (`delete` capability).
    */
-  public listPaths(rawAuthToken: string, prefix = ''): Array<{
+  public deleteSecret(
+    rawAuthToken: string,
+    secretPath: string
+  ): { deleted: boolean; path: string; version: number } {
+    if (this.isSealed() || !this.dek) {
+      throw new Error('Vault is sealed');
+    }
+    const cleanPath = normalizeSecretPath(secretPath);
+    if (!cleanPath) {
+      throw new Error('Secret path is required');
+    }
+    const actor = this.authorize(rawAuthToken, cleanPath, 'delete');
+    const record = this.state.secrets[cleanPath];
+    if (!record) {
+      throw new Error(`Secret path not found: ${cleanPath}`);
+    }
+
+    const cur = record.versions[record.currentVersion];
+    const nowIso = new Date().toISOString();
+    if (cur && !cur.destroyed) {
+      cur.destroyed = true;
+      cur.deletionTime = nowIso;
+      cur.encryptedBlob = null;
+    }
+    record.updatedTime = nowIso;
+    this.saveState();
+
+    this.audit.append({
+      actor: actor.name,
+      action: 'kv.delete',
+      path: cleanPath,
+      status: 'success',
+      metadata: { version: record.currentVersion }
+    });
+
+    return { deleted: true, path: cleanPath, version: record.currentVersion };
+  }
+
+  /**
+   * Lists all active (non-destroyed) secret paths matching an optional prefix.
+   */
+  public listPaths(rawAuthToken: string, prefix = '', includeDeleted = false): Array<{
     path: string;
     currentVersion: number;
     updatedTime: string;
@@ -697,7 +809,13 @@ export class NativeSecretsVaultEngine {
     this.authorize(rawAuthToken, cleanPrefix || '*', 'list');
 
     return Object.values(this.state.secrets)
-      .filter((r) => !cleanPrefix || r.path === cleanPrefix || r.path.startsWith(cleanPrefix + '/'))
+      .filter((r) => {
+        if (!includeDeleted) {
+          const cur = r.versions[r.currentVersion];
+          if (!cur || cur.destroyed) return false;
+        }
+        return !cleanPrefix || r.path === cleanPrefix || r.path.startsWith(cleanPrefix + '/');
+      })
       .sort((a, b) => a.path.localeCompare(b.path))
       .map((r) => {
         const cur = r.versions[r.currentVersion];

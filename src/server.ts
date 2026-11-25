@@ -18,6 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import { URL } from 'url';
 import { NativeSecretsVaultEngine } from './storage/vaultEngine';
+import { BrowserVaultService, generateTotpCode } from './browser/browserVaultService';
 import { formatEnvValue } from './sync/dotenvSync';
 import { renderVaultDashboardHtml } from './ui/dashboardHtml';
 
@@ -85,6 +86,7 @@ export function createVaultServer(options: VaultServerOptions = {}) {
     process.env.NSV_DATA_DIR ||
     path.join(process.cwd(), '.vault-data');
   const engine = new NativeSecretsVaultEngine(dataDir);
+  const browserVault = new BrowserVaultService(engine);
   const startTime = Date.now();
   let httpRequestsTotal = 0;
 
@@ -109,6 +111,23 @@ export function createVaultServer(options: VaultServerOptions = {}) {
 
   const server = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
     httpRequestsTotal++;
+    const reqOrigin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
+    if (
+      reqOrigin.startsWith('chrome-extension://') ||
+      reqOrigin.startsWith('http://127.0.0.1') ||
+      reqOrigin.startsWith('http://localhost')
+    ) {
+      res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Vault-Token');
+      res.setHeader('Vary', 'Origin');
+    }
+    if ((req.method || '').toUpperCase() === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     const rawMethod = (req.method || 'GET').toUpperCase();
     const method = rawMethod === 'HEAD' ? 'GET' : rawMethod;
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1:8200'}`);
@@ -341,6 +360,124 @@ export function createVaultServer(options: VaultServerOptions = {}) {
         });
         sendJson(res, 201, created);
         return;
+      }
+
+      if (method === 'POST' && pathname === '/api/v1/tokens/mint-user-scope') {
+        const token = extractAuthToken(req);
+        const body = await readJsonBody(req);
+        const minted = engine.mintUserScopedToken(
+          token || '',
+          String(body.userId || ''),
+          body.ttlSeconds ? Number(body.ttlSeconds) : 43200
+        );
+        sendJson(res, 201, minted);
+        return;
+      }
+
+      // 7. Winome Browser Credential, TOTP, Sensitive Autofill & Integrations API
+      const browserMatch = pathname.match(/^\/api\/v1\/browser\/([^/]+)\/(.+)$/);
+      if (browserMatch) {
+        const token = extractAuthToken(req);
+        const userId = decodeURIComponent(browserMatch[1]);
+        const subRoute = browserMatch[2];
+
+        if (subRoute === 'logins' && method === 'GET') {
+          const originFilter = parsedUrl.searchParams.get('origin') || undefined;
+          const logins = browserVault.listLogins(token, userId, originFilter);
+          sendJson(res, 200, { count: logins.length, logins });
+          return;
+        }
+
+        if (subRoute === 'logins' && (method === 'POST' || method === 'PUT')) {
+          const body = await readJsonBody(req);
+          const login = browserVault.upsertLogin(token, userId, body as any);
+          sendJson(res, 200, { ok: true, login });
+          return;
+        }
+
+        const loginDeleteMatch = subRoute.match(/^logins\/([^/]+)$/);
+        if (loginDeleteMatch && method === 'DELETE') {
+          const deleted = browserVault.deleteLogin(
+            token,
+            userId,
+            decodeURIComponent(loginDeleteMatch[1])
+          );
+          sendJson(res, 200, { ok: true, ...deleted });
+          return;
+        }
+
+        if (subRoute === 'totp/generate' && method === 'POST') {
+          const body = await readJsonBody(req);
+          engine.authorize(token, `winome/${userId}/logins`, 'read');
+          const totp = generateTotpCode(String(body.secret || body.totpSecret || ''), {
+            nowMs: body.nowMs ? Number(body.nowMs) : undefined,
+            digits: body.digits ? Number(body.digits) : undefined,
+            periodSeconds: body.periodSeconds ? Number(body.periodSeconds) : undefined
+          });
+          sendJson(res, 200, { ok: true, ...totp });
+          return;
+        }
+
+        if (subRoute === 'sensitive-forms' && method === 'GET') {
+          const category = parsedUrl.searchParams.get('category') || undefined;
+          const entries = browserVault.listSensitiveForms(token, userId, category);
+          sendJson(res, 200, { count: entries.length, entries });
+          return;
+        }
+
+        if (subRoute === 'sensitive-forms' && (method === 'POST' || method === 'PUT')) {
+          const body = await readJsonBody(req);
+          const entry = browserVault.upsertSensitiveForm(token, userId, body as any);
+          sendJson(res, 200, { ok: true, entry });
+          return;
+        }
+
+        const sformDeleteMatch = subRoute.match(/^sensitive-forms\/([^/]+)$/);
+        if (sformDeleteMatch && method === 'DELETE') {
+          const deleted = browserVault.deleteSensitiveForm(
+            token,
+            userId,
+            decodeURIComponent(sformDeleteMatch[1])
+          );
+          sendJson(res, 200, { ok: true, ...deleted });
+          return;
+        }
+
+        const authTokMatch = subRoute.match(/^auth-tokens\/([^/]+)$/);
+        if (authTokMatch && method === 'GET') {
+          const record = browserVault.getAuthTokens(
+            token,
+            userId,
+            decodeURIComponent(authTokMatch[1])
+          );
+          sendJson(res, 200, { ok: true, record });
+          return;
+        }
+
+        if (authTokMatch && (method === 'POST' || method === 'PUT')) {
+          const body = await readJsonBody(req);
+          const record = browserVault.putAuthTokens(
+            token,
+            userId,
+            decodeURIComponent(authTokMatch[1]),
+            body
+          );
+          sendJson(res, 200, { ok: true, record });
+          return;
+        }
+
+        if (subRoute === 'integrations' && method === 'GET') {
+          const integrations = browserVault.getIntegrations(token, userId);
+          sendJson(res, 200, { ok: true, integrations });
+          return;
+        }
+
+        if (subRoute === 'integrations' && (method === 'POST' || method === 'PUT')) {
+          const body = await readJsonBody(req);
+          const integrations = browserVault.putIntegrations(token, userId, body);
+          sendJson(res, 200, { ok: true, integrations });
+          return;
+        }
       }
 
       if (method === 'POST' && pathname === '/api/v1/snapshot/export') {
