@@ -383,8 +383,32 @@ export function createVaultServer(options: VaultServerOptions = {}) {
 
         if (subRoute === 'logins' && method === 'GET') {
           const originFilter = parsedUrl.searchParams.get('origin') || undefined;
-          const logins = browserVault.listLogins(token, userId, originFilter);
-          sendJson(res, 200, { count: logins.length, logins });
+          const allLogins = browserVault.listLogins(token, userId, originFilter);
+          const limitRaw = parsedUrl.searchParams.get('limit');
+          const offsetRaw = parsedUrl.searchParams.get('offset');
+          if (limitRaw !== null || offsetRaw !== null) {
+            const offset = Math.max(0, parseInt(offsetRaw || '0', 10) || 0);
+            const limit = Math.min(Math.max(1, parseInt(limitRaw || '100', 10) || 100), 500);
+            const slice = allLogins.slice(offset, offset + limit);
+            sendJson(res, 200, {
+              total: allLogins.length,
+              count: slice.length,
+              offset,
+              limit,
+              hasMore: offset + slice.length < allLogins.length,
+              logins: slice
+            });
+            return;
+          }
+          sendJson(res, 200, { total: allLogins.length, count: allLogins.length, logins: allLogins });
+          return;
+        }
+
+        if (subRoute === 'logins/batch' && (method === 'POST' || method === 'PUT')) {
+          const body = await readJsonBody(req);
+          const items = Array.isArray(body.items) ? body.items : Array.isArray(body.logins) ? body.logins : [];
+          const batchRes = browserVault.upsertLoginsBatch(token, userId, items);
+          sendJson(res, 200, { ok: true, ...batchRes });
           return;
         }
 

@@ -2,6 +2,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { AuditLogger } from '../src/storage/auditLog';
+import { NativeSecretsVaultEngine } from '../src/storage/vaultEngine';
+import { BrowserVaultService } from '../src/browser/browserVaultService';
 
 describe('AuditLogger bounded rotation & oversized log recovery', () => {
   let tmpDir: string;
@@ -86,5 +88,31 @@ describe('AuditLogger bounded rotation & oversized log recovery', () => {
     expect(next.index).toBe(30);
     expect(next.prevHash).toBe(lastHash);
     expect(reopened.verifyChain().valid).toBe(true);
+  });
+
+  it('BrowserVaultService batch-upserts in one flush and serves repeated origin lookups with zero N+1 audit writes', () => {
+    const engine = new NativeSecretsVaultEngine(tmpDir);
+    const init = engine.init({ secretShares: 3, secretThreshold: 2 });
+    const svc = new BrowserVaultService(engine);
+    const minted = engine.mintUserScopedToken(init.root_token, 'usr_chunk_test', 3600);
+
+    const batch = Array.from({ length: 40 }, (_, idx) => ({
+      origin: `https://site-${idx}.com`,
+      username: `user${idx}@site-${idx}.com`,
+      password: `pw_${idx}`
+    }));
+
+    const res = svc.upsertLoginsBatch(minted.token, 'usr_chunk_test', batch);
+    expect(res.upserted).toBe(40);
+
+    const countBefore = engine.verifyAuditChain().totalEntries;
+    // 25 repeated origin autofill lookups across tabs/iframes must write 0 new kv.read lines
+    for (let i = 0; i < 25; i++) {
+      const hits = svc.listLogins(minted.token, 'usr_chunk_test', 'https://site-7.com');
+      expect(hits.length).toBe(1);
+      expect(hits[0].username).toBe('user7@site-7.com');
+    }
+    const countAfter = engine.verifyAuditChain().totalEntries;
+    expect(countAfter).toBe(countBefore);
   });
 });

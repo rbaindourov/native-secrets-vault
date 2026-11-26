@@ -638,6 +638,164 @@ export class NativeSecretsVaultEngine {
   }
 
   /**
+   * Writes a chunk of secrets atomically with a single `saveState()` disk flush
+   * and a single aggregated `kv.write_batch` audit record.
+   */
+  public putSecretsBatch(
+    rawAuthToken: string,
+    items: Array<{
+      path: string;
+      data: Record<string, unknown>;
+      merge?: boolean;
+    }>
+  ): Array<{ path: string; version: number; created_time: string; key_count: number }> {
+    if (this.isSealed() || !this.dek) {
+      throw new Error('Vault is sealed');
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      return [];
+    }
+
+    const normalizedItems = items.map((item) => {
+      const cleanPath = normalizeSecretPath(item.path);
+      if (!cleanPath) {
+        throw new Error('Secret path is required in batch write');
+      }
+      const actor = this.authorize(rawAuthToken, cleanPath, 'write');
+      return { cleanPath, data: item.data, merge: item.merge, actorName: actor.name };
+    });
+
+    const nowIso = new Date().toISOString();
+    const results: Array<{ path: string; version: number; created_time: string; key_count: number }> = [];
+
+    for (const entry of normalizedItems) {
+      const existingRecord = this.state.secrets[entry.cleanPath];
+      const nextVersion = existingRecord ? existingRecord.currentVersion + 1 : 1;
+
+      let finalData: Record<string, unknown> = { ...entry.data };
+      if (entry.merge !== false && existingRecord) {
+        const prevVer = existingRecord.versions[existingRecord.currentVersion];
+        if (prevVer && !prevVer.destroyed && prevVer.encryptedBlob) {
+          const prevAad = `nsv-kv-v2:${entry.cleanPath}:v${prevVer.version}`;
+          const prevPlain = decryptWithContext(
+            this.dek,
+            prevVer.encryptedBlob,
+            prevAad
+          ).toString('utf8');
+          const prevObj = JSON.parse(prevPlain) as Record<string, unknown>;
+          finalData = { ...prevObj };
+          for (const [k, v] of Object.entries(entry.data)) {
+            if (
+              (v === '' || v === null || v === undefined) &&
+              finalData[k] !== undefined &&
+              String(finalData[k]).trim() !== ''
+            ) {
+              continue;
+            }
+            finalData[k] = v;
+          }
+        }
+      }
+
+      const aadContext = `nsv-kv-v2:${entry.cleanPath}:v${nextVersion}`;
+      const encryptedBlob = encryptWithContext(
+        this.dek,
+        JSON.stringify(finalData),
+        aadContext
+      );
+
+      const keyNames = Object.keys(finalData).sort();
+      const versionRecord: SecretVersionRecord = {
+        version: nextVersion,
+        createdTime: nowIso,
+        deletionTime: '',
+        destroyed: false,
+        keyCount: keyNames.length,
+        keyNames,
+        encryptedBlob
+      };
+
+      if (!existingRecord) {
+        this.state.secrets[entry.cleanPath] = {
+          path: entry.cleanPath,
+          currentVersion: 1,
+          oldestVersion: 1,
+          createdTime: nowIso,
+          updatedTime: nowIso,
+          maxVersions: 20,
+          versions: { 1: versionRecord }
+        };
+      } else {
+        existingRecord.currentVersion = nextVersion;
+        existingRecord.updatedTime = nowIso;
+        existingRecord.versions[nextVersion] = versionRecord;
+      }
+
+      results.push({
+        path: entry.cleanPath,
+        version: nextVersion,
+        created_time: nowIso,
+        key_count: keyNames.length
+      });
+    }
+
+    this.saveState();
+    this.audit.append({
+      actor: normalizedItems[0].actorName,
+      action: 'kv.write_batch',
+      path: normalizedItems[0].cleanPath,
+      status: 'success',
+      metadata: { count: results.length }
+    });
+
+    return results;
+  }
+
+  /**
+   * Reads and decrypts all active secrets under `prefixPath` with a single
+   * aggregated `kv.read_prefix` audit record instead of N individual writes.
+   */
+  public getSecretsByPrefix(
+    rawAuthToken: string,
+    prefixPath: string
+  ): Array<{ path: string; version: number; data: Record<string, unknown> }> {
+    if (this.isSealed() || !this.dek) {
+      throw new Error('Vault is sealed');
+    }
+    const cleanPrefix = normalizeSecretPath(prefixPath);
+    if (!cleanPrefix) {
+      throw new Error('Prefix path is required');
+    }
+    const actor = this.authorize(rawAuthToken, `${cleanPrefix}/*`, 'read');
+
+    const out: Array<{ path: string; version: number; data: Record<string, unknown> }> = [];
+    for (const rec of Object.values(this.state.secrets)) {
+      if (rec.path !== cleanPrefix && !rec.path.startsWith(`${cleanPrefix}/`)) {
+        continue;
+      }
+      const verRecord = rec.versions[rec.currentVersion];
+      if (!verRecord || verRecord.destroyed || !verRecord.encryptedBlob) {
+        continue;
+      }
+      this.authorize(rawAuthToken, rec.path, 'read');
+      const aadContext = `nsv-kv-v2:${rec.path}:v${verRecord.version}`;
+      const decryptedBuf = decryptWithContext(this.dek, verRecord.encryptedBlob, aadContext);
+      const data = JSON.parse(decryptedBuf.toString('utf8')) as Record<string, unknown>;
+      out.push({ path: rec.path, version: verRecord.version, data });
+    }
+
+    this.audit.append({
+      actor: actor.name,
+      action: 'kv.read_prefix',
+      path: `${cleanPrefix}/*`,
+      status: 'success',
+      metadata: { count: out.length }
+    });
+
+    return out;
+  }
+
+  /**
    * Reads and decrypts a secret version at `secretPath` (KV v2 `get`).
    */
   public getSecret(
