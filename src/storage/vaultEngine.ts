@@ -46,6 +46,7 @@ export interface SecretVersionRecord {
   destroyed: boolean;
   keyCount: number;
   keyNames: string[]; // Metadata key names only (values are inside encryptedBlob)
+  contentSha256?: string; // Canonical SHA-256 of secret content (excluding volatile timestamps) for O(1) no-op dedup
   encryptedBlob: EncryptedBlob | null;
 }
 
@@ -98,6 +99,39 @@ export interface SealStatusResponse {
 
 function hashToken(rawToken: string): string {
   return crypto.createHash('sha256').update(rawToken, 'utf8').digest('hex');
+}
+
+const VOLATILE_METADATA_KEYS = new Set(['updatedAt', 'lastUsedAt']);
+
+export function computeCanonicalContentSha256(
+  data: Record<string, unknown>,
+  ignoreVolatileTimestamps = true
+): string {
+  const canonicalize = (val: unknown): unknown => {
+    if (Array.isArray(val)) {
+      return val.map(canonicalize);
+    }
+    if (val !== null && typeof val === 'object') {
+      const sorted: Record<string, unknown> = {};
+      for (const k of Object.keys(val as Record<string, unknown>).sort()) {
+        if (ignoreVolatileTimestamps && VOLATILE_METADATA_KEYS.has(k)) continue;
+        sorted[k] = canonicalize((val as Record<string, unknown>)[k]);
+      }
+      return sorted;
+    }
+    return val;
+  };
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(canonicalize(data)), 'utf8')
+    .digest('hex');
+}
+
+function defaultMaxVersionsForPath(cleanPath: string): number {
+  if (/^winome\/[^/]+\/auth-tokens\//.test(cleanPath)) {
+    return 5;
+  }
+  return 20;
 }
 
 export function normalizeSecretPath(rawPath: string): string {
@@ -529,22 +563,40 @@ export class NativeSecretsVaultEngine {
     return { token: newToken, namespace, record: publicRecord };
   }
 
+  private pruneRecordVersions(record: SecretPathRecord): void {
+    const cap = Math.max(1, record.maxVersions || defaultMaxVersionsForPath(record.path));
+    record.maxVersions = cap;
+    const minKeepVersion = Math.max(1, record.currentVersion - cap + 1);
+    for (const verKey of Object.keys(record.versions)) {
+      const verNum = Number(verKey);
+      if (Number.isFinite(verNum) && verNum < minKeepVersion) {
+        delete record.versions[verNum];
+      }
+    }
+    const remaining = Object.keys(record.versions)
+      .map(Number)
+      .filter((n) => Number.isFinite(n))
+      .sort((a, b) => a - b);
+    record.oldestVersion = remaining.length > 0 ? remaining[0] : record.currentVersion;
+  }
+
   /**
    * Writes a new version of key-value secrets at `secretPath` (KV v2 `put`).
    * By default, merges with existing keys in the previous version unless
-   * `options.replaceAll === true` is specified, preventing accidental key loss.
+   * `options.merge === false` is specified, preventing accidental key loss.
    */
   public putSecret(
     rawAuthToken: string,
     secretPath: string,
     incomingData: Record<string, unknown>,
-    options: { merge?: boolean } = {}
+    options: { merge?: boolean; skipIfUnchanged?: boolean; maxVersions?: number } = {}
   ): {
     version: number;
     created_time: string;
     deletion_time: string;
     destroyed: boolean;
     key_count: number;
+    unchanged?: boolean;
   } {
     if (this.isSealed() || !this.dek) {
       throw new Error('Vault is sealed');
@@ -556,19 +608,44 @@ export class NativeSecretsVaultEngine {
 
     const actor = this.authorize(rawAuthToken, cleanPath, 'write');
     const existingRecord = this.state.secrets[cleanPath];
+    const prevVer = existingRecord ? existingRecord.versions[existingRecord.currentVersion] : undefined;
+
+    if (
+      options.skipIfUnchanged &&
+      options.merge === false &&
+      existingRecord &&
+      prevVer &&
+      !prevVer.destroyed &&
+      prevVer.contentSha256
+    ) {
+      const incomingHash = computeCanonicalContentSha256(incomingData, true);
+      if (incomingHash === prevVer.contentSha256) {
+        return {
+          version: prevVer.version,
+          created_time: prevVer.createdTime,
+          deletion_time: prevVer.deletionTime,
+          destroyed: false,
+          key_count: prevVer.keyCount,
+          unchanged: true
+        };
+      }
+    }
+
     const nextVersion = existingRecord ? existingRecord.currentVersion + 1 : 1;
 
     let finalData: Record<string, unknown> = { ...incomingData };
-    if (options.merge !== false && existingRecord) {
-      const prevVer = existingRecord.versions[existingRecord.currentVersion];
-      if (prevVer && !prevVer.destroyed && prevVer.encryptedBlob) {
+    let prevObj: Record<string, unknown> | null = null;
+    if (existingRecord && prevVer && !prevVer.destroyed && prevVer.encryptedBlob) {
+      if (options.merge !== false || (options.skipIfUnchanged && !prevVer.contentSha256)) {
         const prevAad = `nsv-kv-v2:${cleanPath}:v${prevVer.version}`;
         const prevPlain = decryptWithContext(
           this.dek,
           prevVer.encryptedBlob,
           prevAad
         ).toString('utf8');
-        const prevObj = JSON.parse(prevPlain) as Record<string, unknown>;
+        prevObj = JSON.parse(prevPlain) as Record<string, unknown>;
+      }
+      if (options.merge !== false && prevObj) {
         finalData = { ...prevObj };
         for (const [k, v] of Object.entries(incomingData)) {
           // Never clobber an existing non-empty value with an empty string during merge
@@ -581,6 +658,25 @@ export class NativeSecretsVaultEngine {
           }
           finalData[k] = v;
         }
+      }
+    }
+
+    const finalContentSha256 = computeCanonicalContentSha256(finalData, true);
+    if (options.skipIfUnchanged && existingRecord && prevVer && !prevVer.destroyed) {
+      const prevContentSha256 =
+        prevVer.contentSha256 || (prevObj ? computeCanonicalContentSha256(prevObj, true) : '');
+      if (prevContentSha256 && prevContentSha256 === finalContentSha256) {
+        if (!prevVer.contentSha256) {
+          prevVer.contentSha256 = prevContentSha256;
+        }
+        return {
+          version: prevVer.version,
+          created_time: prevVer.createdTime,
+          deletion_time: prevVer.deletionTime,
+          destroyed: false,
+          key_count: prevVer.keyCount,
+          unchanged: true
+        };
       }
     }
 
@@ -600,23 +696,30 @@ export class NativeSecretsVaultEngine {
       destroyed: false,
       keyCount: keyNames.length,
       keyNames,
+      contentSha256: finalContentSha256,
       encryptedBlob
     };
 
     if (!existingRecord) {
-      this.state.secrets[cleanPath] = {
+      const createdRecord: SecretPathRecord = {
         path: cleanPath,
         currentVersion: 1,
         oldestVersion: 1,
         createdTime: nowIso,
         updatedTime: nowIso,
-        maxVersions: 20,
+        maxVersions: options.maxVersions ?? defaultMaxVersionsForPath(cleanPath),
         versions: { 1: versionRecord }
       };
+      this.pruneRecordVersions(createdRecord);
+      this.state.secrets[cleanPath] = createdRecord;
     } else {
+      if (options.maxVersions !== undefined) {
+        existingRecord.maxVersions = options.maxVersions;
+      }
       existingRecord.currentVersion = nextVersion;
       existingRecord.updatedTime = nowIso;
       existingRecord.versions[nextVersion] = versionRecord;
+      this.pruneRecordVersions(existingRecord);
     }
 
     this.saveState();
@@ -633,13 +736,16 @@ export class NativeSecretsVaultEngine {
       created_time: nowIso,
       deletion_time: '',
       destroyed: false,
-      key_count: keyNames.length
+      key_count: keyNames.length,
+      unchanged: false
     };
   }
 
   /**
    * Writes a chunk of secrets atomically with a single `saveState()` disk flush
    * and a single aggregated `kv.write_batch` audit record.
+   * Supports `skipIfUnchanged` so content-identical secrets incur 0 re-encryptions,
+   * 0 version increments, and 0 disk writes when all entries match.
    */
   public putSecretsBatch(
     rawAuthToken: string,
@@ -647,8 +753,17 @@ export class NativeSecretsVaultEngine {
       path: string;
       data: Record<string, unknown>;
       merge?: boolean;
-    }>
-  ): Array<{ path: string; version: number; created_time: string; key_count: number }> {
+      skipIfUnchanged?: boolean;
+      maxVersions?: number;
+    }>,
+    batchAuditAction = 'kv.write_batch'
+  ): Array<{
+    path: string;
+    version: number;
+    created_time: string;
+    key_count: number;
+    unchanged: boolean;
+  }> {
     if (this.isSealed() || !this.dek) {
       throw new Error('Vault is sealed');
     }
@@ -662,27 +777,65 @@ export class NativeSecretsVaultEngine {
         throw new Error('Secret path is required in batch write');
       }
       const actor = this.authorize(rawAuthToken, cleanPath, 'write');
-      return { cleanPath, data: item.data, merge: item.merge, actorName: actor.name };
+      return {
+        cleanPath,
+        data: item.data,
+        merge: item.merge,
+        skipIfUnchanged: Boolean(item.skipIfUnchanged),
+        maxVersions: item.maxVersions,
+        actorName: actor.name
+      };
     });
 
     const nowIso = new Date().toISOString();
-    const results: Array<{ path: string; version: number; created_time: string; key_count: number }> = [];
+    const results: Array<{
+      path: string;
+      version: number;
+      created_time: string;
+      key_count: number;
+      unchanged: boolean;
+    }> = [];
+    let mutatedCount = 0;
+    let hashBackfilled = false;
 
     for (const entry of normalizedItems) {
       const existingRecord = this.state.secrets[entry.cleanPath];
-      const nextVersion = existingRecord ? existingRecord.currentVersion + 1 : 1;
+      const prevVer = existingRecord ? existingRecord.versions[existingRecord.currentVersion] : undefined;
+
+      if (
+        entry.skipIfUnchanged &&
+        entry.merge === false &&
+        existingRecord &&
+        prevVer &&
+        !prevVer.destroyed &&
+        prevVer.contentSha256
+      ) {
+        const incomingHash = computeCanonicalContentSha256(entry.data, true);
+        if (incomingHash === prevVer.contentSha256) {
+          results.push({
+            path: entry.cleanPath,
+            version: prevVer.version,
+            created_time: prevVer.createdTime,
+            key_count: prevVer.keyCount,
+            unchanged: true
+          });
+          continue;
+        }
+      }
 
       let finalData: Record<string, unknown> = { ...entry.data };
-      if (entry.merge !== false && existingRecord) {
-        const prevVer = existingRecord.versions[existingRecord.currentVersion];
-        if (prevVer && !prevVer.destroyed && prevVer.encryptedBlob) {
+      let prevObj: Record<string, unknown> | null = null;
+      if (existingRecord && prevVer && !prevVer.destroyed && prevVer.encryptedBlob) {
+        if (entry.merge !== false || (entry.skipIfUnchanged && !prevVer.contentSha256)) {
           const prevAad = `nsv-kv-v2:${entry.cleanPath}:v${prevVer.version}`;
           const prevPlain = decryptWithContext(
             this.dek,
             prevVer.encryptedBlob,
             prevAad
           ).toString('utf8');
-          const prevObj = JSON.parse(prevPlain) as Record<string, unknown>;
+          prevObj = JSON.parse(prevPlain) as Record<string, unknown>;
+        }
+        if (entry.merge !== false && prevObj) {
           finalData = { ...prevObj };
           for (const [k, v] of Object.entries(entry.data)) {
             if (
@@ -697,6 +850,27 @@ export class NativeSecretsVaultEngine {
         }
       }
 
+      const finalContentSha256 = computeCanonicalContentSha256(finalData, true);
+      if (entry.skipIfUnchanged && existingRecord && prevVer && !prevVer.destroyed) {
+        const prevContentSha256 =
+          prevVer.contentSha256 || (prevObj ? computeCanonicalContentSha256(prevObj, true) : '');
+        if (prevContentSha256 && prevContentSha256 === finalContentSha256) {
+          if (!prevVer.contentSha256) {
+            prevVer.contentSha256 = prevContentSha256;
+            hashBackfilled = true;
+          }
+          results.push({
+            path: entry.cleanPath,
+            version: prevVer.version,
+            created_time: prevVer.createdTime,
+            key_count: prevVer.keyCount,
+            unchanged: true
+          });
+          continue;
+        }
+      }
+
+      const nextVersion = existingRecord ? existingRecord.currentVersion + 1 : 1;
       const aadContext = `nsv-kv-v2:${entry.cleanPath}:v${nextVersion}`;
       const encryptedBlob = encryptWithContext(
         this.dek,
@@ -712,40 +886,55 @@ export class NativeSecretsVaultEngine {
         destroyed: false,
         keyCount: keyNames.length,
         keyNames,
+        contentSha256: finalContentSha256,
         encryptedBlob
       };
 
       if (!existingRecord) {
-        this.state.secrets[entry.cleanPath] = {
+        const createdRecord: SecretPathRecord = {
           path: entry.cleanPath,
           currentVersion: 1,
           oldestVersion: 1,
           createdTime: nowIso,
           updatedTime: nowIso,
-          maxVersions: 20,
+          maxVersions: entry.maxVersions ?? defaultMaxVersionsForPath(entry.cleanPath),
           versions: { 1: versionRecord }
         };
+        this.pruneRecordVersions(createdRecord);
+        this.state.secrets[entry.cleanPath] = createdRecord;
       } else {
+        if (entry.maxVersions !== undefined) {
+          existingRecord.maxVersions = entry.maxVersions;
+        }
         existingRecord.currentVersion = nextVersion;
         existingRecord.updatedTime = nowIso;
         existingRecord.versions[nextVersion] = versionRecord;
+        this.pruneRecordVersions(existingRecord);
       }
 
+      mutatedCount++;
       results.push({
         path: entry.cleanPath,
         version: nextVersion,
         created_time: nowIso,
-        key_count: keyNames.length
+        key_count: keyNames.length,
+        unchanged: false
       });
     }
 
-    this.saveState();
+    if (mutatedCount > 0 || hashBackfilled) {
+      this.saveState();
+    }
     this.audit.append({
       actor: normalizedItems[0].actorName,
-      action: 'kv.write_batch',
+      action: batchAuditAction,
       path: normalizedItems[0].cleanPath,
       status: 'success',
-      metadata: { count: results.length }
+      metadata: {
+        total: results.length,
+        mutated: mutatedCount,
+        skippedUnchanged: results.length - mutatedCount
+      }
     });
 
     return results;

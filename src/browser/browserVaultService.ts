@@ -116,7 +116,7 @@ const MULTI_PART_TLDS = new Set([
 ]);
 
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-const MAX_BATCH_UPSERT = 200;
+const MAX_BATCH_UPSERT = 5000;
 
 export function sanitizeVaultUserId(rawUserId: string): string {
   const clean = String(rawUserId || '').trim();
@@ -370,7 +370,10 @@ export class BrowserVaultService {
     }
 
     const built = this.buildLoginRecord(userId, input, nowIso, createdAt);
-    const meta = this.engine.putSecret(rawToken, built.secretPath, built.persistedPayload, { merge: false });
+    const meta = this.engine.putSecret(rawToken, built.secretPath, built.persistedPayload, {
+      merge: false,
+      skipIfUnchanged: true
+    });
     if (cachedUserMap) {
       cachedUserMap.set(built.secretPath, { version: meta.version, record: built.record });
     }
@@ -378,18 +381,19 @@ export class BrowserVaultService {
   }
 
   /**
-   * Chunked batch credential upsert (up to 200 logins per request).
-   * Flushes `vault-state.json` and appends to `audit.jsonl` ONCE per chunk.
+   * Batch credential upsert (up to 5,000 logins per request) with SHA-256
+   * content-hash no-op deduplication. Flushes `vault-state.json` ONCE only if
+   * at least one credential actually changed, and appends 1 summary audit entry.
    */
   public upsertLoginsBatch(
     rawToken: string,
     rawUserId: string,
     inputs: BrowserLoginInput[]
-  ): { upserted: number; logins: BrowserLoginRecord[] } {
+  ): { upserted: number; mutated: number; skippedUnchanged: number; logins: BrowserLoginRecord[] } {
     this.ensureUnsealedOrClearCaches();
     const userId = sanitizeVaultUserId(rawUserId);
     if (!Array.isArray(inputs) || inputs.length === 0) {
-      return { upserted: 0, logins: [] };
+      return { upserted: 0, mutated: 0, skippedUnchanged: 0, logins: [] };
     }
     if (inputs.length > MAX_BATCH_UPSERT) {
       throw new Error(`Batch size ${inputs.length} exceeds maximum chunk size of ${MAX_BATCH_UPSERT}`);
@@ -397,8 +401,11 @@ export class BrowserVaultService {
 
     const userMap = this.getHydratedUserLogins(rawToken, userId);
     const nowIso = new Date().toISOString();
-    const batchWrites: Array<{ path: string; data: Record<string, unknown>; merge: boolean }> = [];
-    const builtRecords: Array<{ secretPath: string; record: BrowserLoginRecord }> = [];
+    // Deduplicate duplicate (origin + username) rows within the same batch (last wins)
+    const dedupedByPath = new Map<
+      string,
+      { secretPath: string; record: BrowserLoginRecord; persistedPayload: Record<string, unknown> }
+    >();
 
     for (const input of inputs) {
       const { origin } = normalizeOriginUrl(input.origin);
@@ -411,12 +418,30 @@ export class BrowserVaultService {
       const existingCreatedAt = userMap.get(secretPath)?.record?.createdAt || nowIso;
 
       const built = this.buildLoginRecord(userId, input, nowIso, existingCreatedAt);
-      batchWrites.push({ path: built.secretPath, data: built.persistedPayload, merge: false });
-      builtRecords.push({ secretPath: built.secretPath, record: built.record });
+      dedupedByPath.set(secretPath, built);
     }
 
-    const writeResults = this.engine.putSecretsBatch(rawToken, batchWrites);
+    const builtRecords = Array.from(dedupedByPath.values());
+    const batchWrites = builtRecords.map((b) => ({
+      path: b.secretPath,
+      data: b.persistedPayload,
+      merge: false,
+      skipIfUnchanged: true
+    }));
+
+    const writeResults = this.engine.putSecretsBatch(
+      rawToken,
+      batchWrites,
+      'browser.logins.ingest_batch'
+    );
+    let mutated = 0;
+    let skippedUnchanged = 0;
     for (let i = 0; i < builtRecords.length; i++) {
+      if (writeResults[i].unchanged) {
+        skippedUnchanged++;
+      } else {
+        mutated++;
+      }
       userMap.set(builtRecords[i].secretPath, {
         version: writeResults[i].version,
         record: builtRecords[i].record
@@ -424,7 +449,9 @@ export class BrowserVaultService {
     }
 
     return {
-      upserted: builtRecords.length,
+      upserted: mutated,
+      mutated,
+      skippedUnchanged,
       logins: builtRecords.map((b) => b.record)
     };
   }
@@ -560,7 +587,7 @@ export class BrowserVaultService {
       rawToken,
       secretPath,
       record as unknown as Record<string, unknown>,
-      { merge: false }
+      { merge: false, skipIfUnchanged: true }
     );
     if (cachedForms) {
       cachedForms.set(secretPath, { version: meta.version, record });
@@ -652,7 +679,7 @@ export class BrowserVaultService {
       rawToken,
       `winome/${userId}/auth-tokens/${cleanDomain}`,
       record as unknown as Record<string, unknown>,
-      { merge: false }
+      { merge: false, skipIfUnchanged: true, maxVersions: 5 }
     );
     return record;
   }

@@ -225,6 +225,27 @@ export function renderVaultDashboardHtml(): string {
         <div id="secretInspector">
           <p style="color:var(--muted);font-size:0.9rem;">Select a namespace on the left after authenticating to inspect encrypted keys, version history, or export lossless <code>.env</code> bundles.</p>
         </div>
+
+        <h2 style="margin-top:24px;">Smart Batch Ingest (CSV • .env • KV JSON • SHA-256 Dedup)</h2>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:10px;">
+          <select id="ingestFormat">
+            <option value="auto">Auto-Detect Format</option>
+            <option value="csv">Browser Passwords CSV (RFC-4180)</option>
+            <option value="dotenv">Dotenv (.env Auto-Classified)</option>
+            <option value="kv-bundle-json">KV v2 JSON Bundle</option>
+            <option value="browser-logins-json">Winome Logins JSON</option>
+          </select>
+          <input id="ingestUserId" type="text" placeholder="User ID (default: default)" />
+          <input id="ingestTargetPath" type="text" placeholder="Override Path (optional, e.g. infra/r7000)" />
+          <input id="ingestFile" type="file" accept=".csv,.env,.json,.txt" onchange="loadIngestFile(this)" />
+        </div>
+        <textarea id="ingestPayload" rows="4" style="width:100%;margin-bottom:10px;" placeholder="Paste CSV export, .env file, or JSON bundle here (unchanged secrets are skipped automatically with 0 disk writes)..."></textarea>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+          <button onclick="runSmartIngest(true)" style="background:rgba(56,189,248,0.18);border:1px solid var(--border);">Dry-Run Preview</button>
+          <button onclick="runSmartIngest(false)">Smart Ingest Now</button>
+          <span id="ingestResult" style="font-size:0.84rem;color:var(--muted);"></span>
+        </div>
+
         <h2 style="margin-top:24px;">Recent Hash-Chained Audit Events</h2>
         <div id="auditList"><small style="color:var(--muted)">Authenticate to view tamper-evident audit trail.</small></div>
       </div>
@@ -296,6 +317,51 @@ export function renderVaultDashboardHtml(): string {
       document.getElementById('secretInspector').innerHTML =
         '<p><small style="color:var(--muted)">Click any masked value below to reveal its decrypted plaintext.</small></p>' +
         '<table class="kv-table"><thead><tr><th>Key</th><th>Decrypted Value (Click to Reveal)</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    }
+
+    function loadIngestFile(input) {
+      var file = input && input.files && input.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function(ev) {
+        document.getElementById('ingestPayload').value = String(ev.target.result || '');
+      };
+      reader.readAsText(file);
+    }
+
+    async function runSmartIngest(dryRun) {
+      var token = getToken();
+      var resEl = document.getElementById('ingestResult');
+      if (!token) {
+        resEl.innerHTML = '<span class="badge-err">Enter X-Vault-Token above first.</span>';
+        return;
+      }
+      var payloadText = document.getElementById('ingestPayload').value;
+      if (!payloadText.trim()) {
+        resEl.innerHTML = '<span class="badge-warn">Paste or choose a file to ingest.</span>';
+        return;
+      }
+      resEl.textContent = dryRun ? 'Running dry-run...' : 'Ingesting...';
+      var resp = await fetch('/api/v1/ingest/smart', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Token': token },
+        body: JSON.stringify({
+          format: document.getElementById('ingestFormat').value,
+          userId: document.getElementById('ingestUserId').value.trim() || undefined,
+          targetPath: document.getElementById('ingestTargetPath').value.trim() || undefined,
+          dryRun: Boolean(dryRun),
+          payload: payloadText
+        })
+      });
+      var out = await resp.json();
+      if (!resp.ok) {
+        resEl.innerHTML = '<span class="badge-err">' + ((out.errors && out.errors[0]) || 'Ingest failed') + '</span>';
+        return;
+      }
+      resEl.innerHTML = '<span class="badge-ok">[' + out.detectedFormat + (out.dryRun ? ' DRY-RUN' : '') + ']</span> ' +
+        'Mutated: <strong>' + out.mutated + '</strong> • Skipped unchanged: <strong>' + out.skippedUnchanged + '</strong> • Rejected: ' + out.rejected +
+        ' • Paths: <code>' + (out.targetPaths || []).join(', ') + '</code>';
+      if (!dryRun) loadDashboard();
     }
 
     loadDashboard();

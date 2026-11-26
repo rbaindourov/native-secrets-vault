@@ -30,6 +30,9 @@ Built with **zero runtime npm dependencies** (100% Node.js native `crypto`, `htt
    - Every read, write, seal/unseal, token issuance, and snapshot export appends a cryptographically linked record (`prevHash` $\rightarrow$ `hash`) without ever logging raw secret values.
 6. **Built-In Web UI (`/ui`) & Prometheus Exporter (`/metrics`)**:
    - Native observability for Grafana & Prometheus (`vault_sealed`, `vault_secrets_total`, `vault_audit_chain_valid`, `vault_http_requests_total`).
+7. **Smart Batch Ingest, SHA-256 Content Deduplication & Version Pruning**:
+   - Unified ingest endpoints (`POST /api/v1/ingest/smart` and `POST /api/v1/browser/:userId/ingest`) accept RFC-4180 browser password CSVs (Chrome, Brave, Bitwarden, 1Password), `.env` files (auto-classified into `cms/prod`, `oauth/prod`, `billing/prod`, `email-crm/prod`, `google-apis/prod`, `infra/r7000`), and KV v2 JSON bundles in a single atomic disk commit.
+   - SHA-256 canonical content hashing skips unchanged secrets with zero AES-GCM re-encryptions, zero version increments, and zero disk writes, while `maxVersions` automatically bounds historical version retention (`5` for rotating `auth-tokens`, `20` for standard KV paths).
 
 ---
 

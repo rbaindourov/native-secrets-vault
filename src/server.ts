@@ -15,10 +15,12 @@
 
 import http, { IncomingMessage, ServerResponse } from 'http';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { URL } from 'url';
 import { NativeSecretsVaultEngine } from './storage/vaultEngine';
 import { BrowserVaultService, generateTotpCode } from './browser/browserVaultService';
+import { SmartIngestFormat, SmartIngestService } from './ingest/smartIngestService';
 import { formatEnvValue } from './sync/dotenvSync';
 import { renderVaultDashboardHtml } from './ui/dashboardHtml';
 
@@ -41,33 +43,119 @@ function extractAuthToken(req: IncomingMessage): string {
   return '';
 }
 
-function readJsonBody(req: IncomingMessage): Promise<Record<string, any>> {
+function readRawBody(req: IncomingMessage, maxBytes = 5 * 1024 * 1024): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     req.on('data', (chunk: Buffer) => {
       totalBytes += chunk.length;
-      if (totalBytes > 5 * 1024 * 1024) {
-        reject(new Error('Request body exceeds 5MB limit'));
+      if (totalBytes > maxBytes) {
+        reject(new Error(`Request body exceeds ${Math.round(maxBytes / (1024 * 1024))}MB limit`));
         req.destroy();
         return;
       }
       chunks.push(chunk);
     });
     req.on('end', () => {
-      const raw = Buffer.concat(chunks).toString('utf8').trim();
-      if (!raw) {
-        resolve({});
-        return;
-      }
-      try {
-        resolve(JSON.parse(raw));
-      } catch (err) {
-        reject(new Error('Invalid JSON payload'));
-      }
+      resolve(Buffer.concat(chunks).toString('utf8'));
     });
     req.on('error', reject);
   });
+}
+
+async function readJsonBody(
+  req: IncomingMessage,
+  maxBytes = 5 * 1024 * 1024
+): Promise<Record<string, any>> {
+  const raw = (await readRawBody(req, maxBytes)).trim();
+  if (!raw) {
+    return {};
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    throw new Error('Invalid JSON payload');
+  }
+}
+
+async function readIngestPayload(
+  req: IncomingMessage,
+  parsedUrl: URL
+): Promise<{
+  format?: SmartIngestFormat;
+  userId?: string;
+  targetPath?: string;
+  merge?: boolean;
+  dryRun?: boolean;
+  payload: unknown;
+}> {
+  const raw = await readRawBody(req, 15 * 1024 * 1024);
+  const contentType = String(req.headers['content-type'] || '').toLowerCase();
+  const queryFormat = (parsedUrl.searchParams.get('format') || undefined) as
+    | SmartIngestFormat
+    | undefined;
+  const queryUserId = parsedUrl.searchParams.get('userId') || undefined;
+  const queryTargetPath = parsedUrl.searchParams.get('targetPath') || undefined;
+  const queryDryRun =
+    parsedUrl.searchParams.get('dryRun') === 'true' ||
+    parsedUrl.searchParams.get('dryRun') === '1';
+  const queryMerge = parsedUrl.searchParams.get('merge') !== 'false';
+
+  if (
+    contentType.includes('text/csv') ||
+    contentType.includes('text/plain') ||
+    contentType.includes('application/x-dotenv')
+  ) {
+    return {
+      format: queryFormat || (contentType.includes('text/csv') ? 'csv' : 'auto'),
+      userId: queryUserId,
+      targetPath: queryTargetPath,
+      merge: queryMerge,
+      dryRun: queryDryRun,
+      payload: raw
+    };
+  }
+
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error('Smart ingest payload cannot be empty');
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      'payload' in parsed
+    ) {
+      return {
+        format: (parsed.format || queryFormat || 'auto') as SmartIngestFormat,
+        userId: parsed.userId || queryUserId,
+        targetPath: parsed.targetPath || queryTargetPath,
+        merge: parsed.merge !== undefined ? Boolean(parsed.merge) : queryMerge,
+        dryRun: parsed.dryRun !== undefined ? Boolean(parsed.dryRun) : queryDryRun,
+        payload: parsed.payload
+      };
+    }
+    return {
+      format: queryFormat || 'auto',
+      userId: queryUserId,
+      targetPath: queryTargetPath,
+      merge: queryMerge,
+      dryRun: queryDryRun,
+      payload: parsed
+    };
+  } catch (_) {
+    // Fallback to raw text auto-detection (CSV or .env pasted directly)
+    return {
+      format: queryFormat || 'auto',
+      userId: queryUserId,
+      targetPath: queryTargetPath,
+      merge: queryMerge,
+      dryRun: queryDryRun,
+      payload: raw
+    };
+  }
 }
 
 function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
@@ -87,6 +175,7 @@ export function createVaultServer(options: VaultServerOptions = {}) {
     path.join(process.cwd(), '.vault-data');
   const engine = new NativeSecretsVaultEngine(dataDir);
   const browserVault = new BrowserVaultService(engine);
+  const smartIngest = new SmartIngestService(engine, browserVault);
   const startTime = Date.now();
   let httpRequestsTotal = 0;
 
@@ -115,7 +204,8 @@ export function createVaultServer(options: VaultServerOptions = {}) {
     if (
       reqOrigin.startsWith('chrome-extension://') ||
       reqOrigin.startsWith('http://127.0.0.1') ||
-      reqOrigin.startsWith('http://localhost')
+      reqOrigin.startsWith('http://localhost') ||
+      /^https?:\/\/[a-z0-9-]+\.local(?::\d+)?$/i.test(reqOrigin)
     ) {
       res.setHeader('Access-Control-Allow-Origin', reqOrigin);
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -374,12 +464,30 @@ export function createVaultServer(options: VaultServerOptions = {}) {
         return;
       }
 
+      if (method === 'POST' && pathname === '/api/v1/ingest/smart') {
+        const token = extractAuthToken(req);
+        const ingestReq = await readIngestPayload(req, parsedUrl);
+        const report = smartIngest.ingest(token, ingestReq);
+        sendJson(res, 200, report);
+        return;
+      }
+
       // 7. Winome Browser Credential, TOTP, Sensitive Autofill & Integrations API
       const browserMatch = pathname.match(/^\/api\/v1\/browser\/([^/]+)\/(.+)$/);
       if (browserMatch) {
         const token = extractAuthToken(req);
         const userId = decodeURIComponent(browserMatch[1]);
         const subRoute = browserMatch[2];
+
+        if (subRoute === 'ingest' && (method === 'POST' || method === 'PUT')) {
+          const ingestReq = await readIngestPayload(req, parsedUrl);
+          const report = smartIngest.ingest(token, {
+            ...ingestReq,
+            userId
+          });
+          sendJson(res, 200, report);
+          return;
+        }
 
         if (subRoute === 'logins' && method === 'GET') {
           const originFilter = parsedUrl.searchParams.get('origin') || undefined;
@@ -533,6 +641,111 @@ export function createVaultServer(options: VaultServerOptions = {}) {
   return { server, engine };
 }
 
+function postRegistryJson(baseUrl: string, apiPath: string, body: unknown): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(apiPath, baseUrl);
+    const payload = Buffer.from(JSON.stringify(body), 'utf8');
+    const req = http.request(
+      {
+        hostname: target.hostname,
+        port: target.port || 80,
+        path: target.pathname,
+        method: 'POST',
+        timeout: 2500,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': payload.length
+        }
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          if ((res.statusCode || 500) >= 400) {
+            reject(new Error(`HTTP ${res.statusCode}: ${raw}`));
+            return;
+          }
+          try {
+            resolve(raw ? JSON.parse(raw) : {});
+          } catch (_) {
+            resolve({});
+          }
+        });
+      }
+    );
+    req.on('timeout', () => {
+      req.destroy(new Error('Registry request timeout'));
+    });
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+function startServiceRegistryHeartbeat(port: number): void {
+  if (process.env.NSV_DISABLE_REGISTRY === 'true') return;
+  const rawHostname = (process.env.NODE_ID || os.hostname() || 'localhost')
+    .split('.')[0]
+    .toLowerCase();
+  const candidates = Array.from(
+    new Set(
+      [
+        process.env.SERVICE_REGISTRY_URL,
+        'http://registry.local',
+        'http://ww2.local:8500'
+      ].filter(Boolean) as string[]
+    )
+  );
+
+  let registeredInstanceId = '';
+  let activeRegistryUrl = candidates[0];
+
+  const syncOnce = async () => {
+    const registrationPayload = {
+      serviceName: 'native-secrets-vault',
+      nodeId: rawHostname,
+      host: `${rawHostname}.local`,
+      port,
+      protocol: 'http',
+      healthEndpoint: '/v1/sys/health',
+      metadata: {
+        localAliases: ['vault.local'],
+        canonicalHostname: `${rawHostname}.local`,
+        role: 'primary'
+      }
+    };
+
+    for (const candidateUrl of [activeRegistryUrl, ...candidates.filter((c) => c !== activeRegistryUrl)]) {
+      try {
+        if (registeredInstanceId) {
+          await postRegistryJson(candidateUrl, '/v1/catalog/heartbeat', {
+            instanceId: registeredInstanceId
+          });
+          activeRegistryUrl = candidateUrl;
+          return;
+        }
+        const reg = await postRegistryJson(candidateUrl, '/v1/catalog/register', registrationPayload);
+        if (reg?.instance?.instanceId) {
+          registeredInstanceId = String(reg.instance.instanceId);
+          activeRegistryUrl = candidateUrl;
+          return;
+        }
+      } catch (err: any) {
+        if (String(err?.message || '').includes('404')) {
+          registeredInstanceId = '';
+        }
+      }
+    }
+  };
+
+  void syncOnce();
+  const timer = setInterval(() => {
+    void syncOnce();
+  }, 15000);
+  if (typeof timer.unref === 'function') timer.unref();
+}
+
 if (require.main === module) {
   const host = process.env.NSV_HOST || '127.0.0.1';
   const port = parseInt(process.env.NSV_PORT || '8200', 10);
@@ -544,5 +757,6 @@ if (require.main === module) {
     console.log(
       `[Native Secrets Vault] Listening on http://${host}:${port} (Web UI: http://${host}:${port}/ui, Metrics: http://${host}:${port}/metrics)`
     );
+    startServiceRegistryHeartbeat(port);
   });
 }
