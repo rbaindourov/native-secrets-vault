@@ -379,19 +379,16 @@ export class NativeSecretsVaultEngine {
     return this.getSealStatus();
   }
 
-  /**
-   * Authenticates a Bearer/X-Vault-Token and verifies path + capability permissions.
-   */
-  public authorize(
+  private validateTokenRecord(
     rawToken: string | undefined,
-    targetPath: string,
-    capability: Capability
+    auditPath: string,
+    auditAction: string
   ): TokenRecord {
     if (!rawToken) {
       this.audit.append({
         actor: 'anonymous',
-        action: `auth.${capability}`,
-        path: targetPath,
+        action: auditAction,
+        path: auditPath,
         status: 'denied',
         metadata: { reason: 'missing_token' }
       });
@@ -405,8 +402,8 @@ export class NativeSecretsVaultEngine {
     if (!record) {
       this.audit.append({
         actor: 'unknown_token',
-        action: `auth.${capability}`,
-        path: targetPath,
+        action: auditAction,
+        path: auditPath,
         status: 'denied',
         metadata: { reason: 'invalid_token' }
       });
@@ -416,13 +413,70 @@ export class NativeSecretsVaultEngine {
     if (record.expiresAt && new Date(record.expiresAt).getTime() < Date.now()) {
       this.audit.append({
         actor: record.name,
-        action: `auth.${capability}`,
-        path: targetPath,
+        action: auditAction,
+        path: auditPath,
         status: 'denied',
         metadata: { reason: 'expired_token' }
       });
       throw new Error('Permission denied: token has expired');
     }
+
+    return record;
+  }
+
+  /**
+   * Returns caller identity, capabilities, and accessible `winome/<userId>` namespaces.
+   */
+  public inspectToken(rawToken: string | undefined): {
+    id: string;
+    name: string;
+    capabilities: Capability[];
+    allowedPaths: string[];
+    expiresAt: string | null;
+    isRoot: boolean;
+    browserUserIds: string[];
+  } {
+    const record = this.validateTokenRecord(rawToken, 'sys/tokens/self', 'auth.inspect');
+    const isRoot =
+      record.capabilities.includes('root') || record.allowedPaths.includes('*');
+    const canListAllWinome =
+      isRoot || record.allowedPaths.some((p) => normalizeSecretPath(p) === 'winome/*');
+
+    const userIds = new Set<string>();
+    for (const pattern of record.allowedPaths) {
+      const m = normalizeSecretPath(pattern).match(/^winome\/([^/*]+)(?:\/|$)/);
+      if (m && m[1]) userIds.add(m[1]);
+    }
+    if (canListAllWinome) {
+      for (const secretPath of Object.keys(this.state.secrets)) {
+        const rec = this.state.secrets[secretPath];
+        const cur = rec?.versions[rec.currentVersion];
+        if (!cur || cur.destroyed) continue;
+        const m = secretPath.match(/^winome\/([^/]+)\//);
+        if (m && m[1]) userIds.add(m[1]);
+      }
+    }
+
+    return {
+      id: record.id,
+      name: record.name,
+      capabilities: record.capabilities,
+      allowedPaths: record.allowedPaths,
+      expiresAt: record.expiresAt,
+      isRoot,
+      browserUserIds: Array.from(userIds).sort()
+    };
+  }
+
+  /**
+   * Authenticates a Bearer/X-Vault-Token and verifies path + capability permissions.
+   */
+  public authorize(
+    rawToken: string | undefined,
+    targetPath: string,
+    capability: Capability
+  ): TokenRecord {
+    const record = this.validateTokenRecord(rawToken, targetPath, `auth.${capability}`);
 
     const hasCap =
       record.capabilities.includes('root') ||

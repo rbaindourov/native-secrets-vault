@@ -14,6 +14,7 @@
  */
 
 import http, { IncomingMessage, ServerResponse } from 'http';
+import https from 'https';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -29,6 +30,7 @@ export interface VaultServerOptions {
   host?: string;
   port?: number;
   autoUnsealFile?: string;
+  usersBackendUrl?: string;
 }
 
 function extractAuthToken(req: IncomingMessage): string {
@@ -224,8 +226,8 @@ export function createVaultServer(options: VaultServerOptions = {}) {
     const pathname = parsedUrl.pathname;
 
     try {
-      // 1. Web UI Dashboard
-      if (method === 'GET' && (pathname === '/' || pathname === '/ui')) {
+      // 1. Web UI Dashboard & Password Manager
+      if (method === 'GET' && (pathname === '/' || pathname === '/ui' || pathname === '/passwords')) {
         const html = renderVaultDashboardHtml();
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);
@@ -439,6 +441,12 @@ export function createVaultServer(options: VaultServerOptions = {}) {
         return;
       }
 
+      if (method === 'GET' && pathname === '/api/v1/tokens/self') {
+        const token = extractAuthToken(req);
+        sendJson(res, 200, engine.inspectToken(token));
+        return;
+      }
+
       if (method === 'POST' && pathname === '/api/v1/tokens') {
         const token = extractAuthToken(req);
         const body = await readJsonBody(req);
@@ -469,6 +477,41 @@ export function createVaultServer(options: VaultServerOptions = {}) {
         const ingestReq = await readIngestPayload(req, parsedUrl);
         const report = smartIngest.ingest(token, ingestReq);
         sendJson(res, 200, report);
+        return;
+      }
+
+      // Winome Web UI Login Bridge (exchanges Winome credentials via users-backend for scoped nsv_usr_ token)
+      if (method === 'POST' && pathname === '/api/v1/browser/auth/winome-login') {
+        const body = await readJsonBody(req);
+        const identifier = String(body.username || body.email || '').trim();
+        const password = String(body.password || '');
+        if (!identifier || !password) {
+          sendJson(res, 400, { errors: ['Username/email and password are required'] });
+          return;
+        }
+        const usersBase = await resolveUsersBackendUrl(options.usersBackendUrl);
+        const loginPayload = {
+          username: identifier,
+          ...(identifier.includes('@') ? { email: identifier } : {}),
+          password,
+          device: { deviceId: 'vault-web-ui', hostname: os.hostname() }
+        };
+        const upstream = await httpRequestJson('POST', `${usersBase}/browser/login`, loginPayload, 6000);
+        if (upstream.status >= 400 || !upstream.body?.ok || !upstream.body?.vault?.token) {
+          const msg = upstream.body?.message || upstream.body?.error || 'Invalid Winome credentials or users-backend unavailable';
+          sendJson(res, upstream.status === 401 || upstream.status === 403 ? upstream.status : 401, {
+            errors: [msg]
+          });
+          return;
+        }
+        sendJson(res, 200, {
+          ok: true,
+          userId: String(upstream.body.user?.id || ''),
+          username: String(upstream.body.user?.username || identifier),
+          email: String(upstream.body.user?.email || ''),
+          displayName: String(upstream.body.user?.displayName || upstream.body.user?.username || identifier),
+          token: String(upstream.body.vault.token)
+        });
         return;
       }
 
@@ -557,6 +600,14 @@ export function createVaultServer(options: VaultServerOptions = {}) {
           return;
         }
 
+        if (subRoute === 'sensitive-forms/batch' && (method === 'POST' || method === 'PUT')) {
+          const body = await readJsonBody(req);
+          const items = Array.isArray(body.items) ? body.items : Array.isArray(body.entries) ? body.entries : [];
+          const batchRes = browserVault.upsertSensitiveFormsBatch(token, userId, items);
+          sendJson(res, 200, { ok: true, ...batchRes });
+          return;
+        }
+
         if (subRoute === 'sensitive-forms' && (method === 'POST' || method === 'PUT')) {
           const body = await readJsonBody(req);
           const entry = browserVault.upsertSensitiveForm(token, userId, body as any);
@@ -641,46 +692,86 @@ export function createVaultServer(options: VaultServerOptions = {}) {
   return { server, engine };
 }
 
-function postRegistryJson(baseUrl: string, apiPath: string, body: unknown): Promise<any> {
+function httpRequestJson(
+  method: 'GET' | 'POST',
+  urlStr: string,
+  body?: unknown,
+  timeoutMs = 3000
+): Promise<{ status: number; body: any }> {
   return new Promise((resolve, reject) => {
-    const target = new URL(apiPath, baseUrl);
-    const payload = Buffer.from(JSON.stringify(body), 'utf8');
-    const req = http.request(
+    const target = new URL(urlStr);
+    const payload = body !== undefined ? Buffer.from(JSON.stringify(body), 'utf8') : undefined;
+    const lib = target.protocol === 'https:' ? https : http;
+    const headers: Record<string, string | number> = { Accept: 'application/json' };
+    if (payload) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = payload.length;
+    }
+    const req = lib.request(
       {
         hostname: target.hostname,
-        port: target.port || 80,
-        path: target.pathname,
-        method: 'POST',
-        timeout: 2500,
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': payload.length
-        }
+        port: target.port || (target.protocol === 'https:' ? 443 : 80),
+        path: `${target.pathname}${target.search}`,
+        method,
+        timeout: timeoutMs,
+        headers
       },
       (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf8');
-          if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`HTTP ${res.statusCode}: ${raw}`));
-            return;
-          }
+          let parsed: any = {};
           try {
-            resolve(raw ? JSON.parse(raw) : {});
+            parsed = raw ? JSON.parse(raw) : {};
           } catch (_) {
-            resolve({});
+            parsed = { raw };
           }
+          resolve({ status: res.statusCode || 500, body: parsed });
         });
       }
     );
     req.on('timeout', () => {
-      req.destroy(new Error('Registry request timeout'));
+      req.destroy(new Error(`Request timeout (${timeoutMs}ms): ${urlStr}`));
     });
     req.on('error', reject);
-    req.write(payload);
+    if (payload) req.write(payload);
     req.end();
   });
+}
+
+async function resolveUsersBackendUrl(overrideUrl?: string): Promise<string> {
+  const direct = String(overrideUrl || process.env.USERS_BACKEND_URL || '').trim();
+  if (direct) return direct.replace(/\/+$/, '');
+
+  const registryCandidates = [
+    process.env.SERVICE_REGISTRY_URL,
+    'http://registry.local',
+    'http://ww2.local:8500'
+  ].filter(Boolean) as string[];
+
+  for (const regUrl of registryCandidates) {
+    try {
+      const cleanReg = regUrl.replace(/\/+$/, '');
+      const res = await httpRequestJson('GET', `${cleanReg}/v1/catalog/services/users-backend`, undefined, 1500);
+      const instances = Array.isArray(res.body?.instances) ? res.body.instances : [];
+      const healthy = instances.find((i: any) => i.status === 'healthy') || instances[0];
+      if (healthy?.host && healthy?.port) {
+        return `${healthy.protocol || 'http'}://${healthy.host}:${healthy.port}`;
+      }
+    } catch (_) {}
+  }
+
+  return 'http://ww2.local:3030';
+}
+
+async function postRegistryJson(baseUrl: string, apiPath: string, body: unknown): Promise<any> {
+  const target = new URL(apiPath, baseUrl);
+  const res = await httpRequestJson('POST', target.toString(), body, 2500);
+  if (res.status >= 400) {
+    throw new Error(`HTTP ${res.status}: ${JSON.stringify(res.body)}`);
+  }
+  return res.body;
 }
 
 function startServiceRegistryHeartbeat(port: number): void {

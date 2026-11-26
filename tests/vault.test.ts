@@ -189,6 +189,10 @@ describe('Native Secrets Vault — Cryptographic & Integration Test Suite', () =
       const ui = await reqJson('GET', '/ui');
       expect(ui.status).toBe(200);
       expect(String(ui.data)).toContain('Native Secrets Vault');
+      const scriptMatch = String(ui.data).match(/<script>([\s\S]*?)<\/script>/);
+      expect(scriptMatch).not.toBeNull();
+      // Validate inline dashboard script compiles cleanly with zero syntax errors
+      expect(() => new Function(scriptMatch![1])).not.toThrow();
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

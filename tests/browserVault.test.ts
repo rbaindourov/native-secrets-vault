@@ -272,5 +272,29 @@ describe('Winome Browser Vault Service & Scoped User Isolation', () => {
     // Audit chain must remain 100% cryptographically valid
     const auditVerify = await httpJson(port, 'GET', '/api/v1/audit/verify');
     expect(auditVerify.body.valid).toBe(true);
+
+    // Token self-inspection & Password Manager UI endpoint
+    const selfAlice = await httpJson(port, 'GET', '/api/v1/tokens/self', undefined, aliceToken);
+    expect(selfAlice.status).toBe(200);
+    expect(selfAlice.body.isRoot).toBe(false);
+    expect(selfAlice.body.browserUserIds).toEqual(['user_alice_01']);
+
+    const selfRoot = await httpJson(port, 'GET', '/api/v1/tokens/self', undefined, rootToken);
+    expect(selfRoot.status).toBe(200);
+    expect(selfRoot.body.isRoot).toBe(true);
+    expect(selfRoot.body.browserUserIds).toContain('user_alice_01');
+
+    const selfNoTok = await httpJson(port, 'GET', '/api/v1/tokens/self');
+    expect(selfNoTok.status).toBe(403);
+
+    const uiPwRes = await httpJson(port, 'GET', '/passwords');
+    expect(uiPwRes.status).toBe(200);
+    expect(String(uiPwRes.body)).toContain('pmSearch');
+    expect(String(uiPwRes.body)).toContain('loginWithWinome');
+
+    const badLogin = await httpJson(port, 'POST', '/api/v1/browser/auth/winome-login', {
+      username: 'god'
+    });
+    expect(badLogin.status).toBe(400);
   });
 });

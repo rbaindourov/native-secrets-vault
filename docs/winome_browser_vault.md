@@ -22,13 +22,19 @@
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
+| `GET` | `/`, `/ui`, `/passwords` | Glassmorphic Vault Dashboard & searchable Password Manager UI (supports Winome login or Vault token) |
+| `GET` | `/api/v1/tokens/self` | Inspect caller capabilities and discover accessible `winome/<userId>` namespaces |
+| `POST` | `/api/v1/browser/auth/winome-login` | Authenticate with Winome credentials via `users-backend` (`registry.local`) for a scoped `nsv_usr_*` session token |
 | `POST` | `/api/v1/tokens/mint-user-scope` | Mint time-bounded token scoped to `winome/<userId>/*` |
 | `GET` | `/api/v1/browser/:userId/logins?origin=...` | List all logins or match exact origin + `eTLD+1` subdomains with live TOTP codes |
 | `POST` | `/api/v1/browser/:userId/logins` | Create or update an encrypted website login |
+| `POST` | `/api/v1/browser/:userId/logins/batch` | Batch upsert website logins with SHA-256 content-hash deduplication |
 | `DELETE` | `/api/v1/browser/:userId/logins/:credentialId` | Cryptographically destroy a login entry |
 | `POST` | `/api/v1/browser/:userId/totp/generate` | Compute RFC 6238 TOTP code from Base32 secret or `otpauth://` URI |
-| `GET` | `/api/v1/browser/:userId/sensitive-forms` | List encrypted payment cards & sensitive form entries |
+| `GET` | `/api/v1/browser/:userId/sensitive-forms` | List encrypted payment cards, addresses & non-web app entries |
 | `POST` | `/api/v1/browser/:userId/sensitive-forms` | Create or update a sensitive form entry |
+| `POST` | `/api/v1/browser/:userId/sensitive-forms/batch` | Batch upsert sensitive form entries in one SHA-256 deduplicated commit |
+| `POST` | `/api/v1/browser/:userId/ingest` | Unified Smart Ingest for CSV, `logins[]`, and `sensitiveForms[]` bundles |
 | `DELETE` | `/api/v1/browser/:userId/sensitive-forms/:entryId` | Destroy a sensitive form entry |
 | `GET/PUT` | `/api/v1/browser/:userId/auth-tokens/:domain` | Read or store encrypted session cookies/tokens for a domain |
 | `GET/PUT` | `/api/v1/browser/:userId/integrations` | Read or store ABM/CRM/CMS API keys for zero-manual-config browser bootstrap |

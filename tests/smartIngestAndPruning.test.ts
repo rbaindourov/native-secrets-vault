@@ -252,4 +252,95 @@ describe('Smart Ingest, SHA-256 Deduplication & maxVersions Pruning', () => {
     expect(stdMeta.body.data.oldest_version).toBe(6);
     expect(Object.keys(stdMeta.body.data.versions)).toHaveLength(20);
   });
+
+  it('batch-ingests mixed browser logins and sensitiveForms (cards, Android apps, addresses) with zero-write idempotency', async () => {
+    const bundlePayload = {
+      logins: [
+        {
+          origin: 'https://www.aetna.com',
+          username: 'patient1',
+          password: 'secret-web-password'
+        }
+      ],
+      sensitiveForms: [
+        {
+          id: 'spass_android_steam',
+          category: 'secret_field',
+          label: 'Steam (com.valvesoftware.android.steam.community)',
+          origins: ['android://hash@com.valvesoftware.android.steam.community'],
+          fields: {
+            kind: 'android_app_login',
+            username: 'gamer',
+            password: 'secret-app-password',
+            packageName: 'com.valvesoftware.android.steam.community'
+          }
+        },
+        {
+          id: 'spass_card_3114',
+          category: 'payment_card',
+          label: 'Visa •••• 3114',
+          fields: {
+            cardholderName: 'Robert Baindourov',
+            last4: '3114',
+            expiryMonth: '10',
+            expiryYear: '27'
+          }
+        },
+        {
+          id: 'spass_addr_1',
+          category: 'identity_document',
+          label: 'Primary Address',
+          fields: {
+            fullName: 'Robert Baindourov',
+            streetAddress: '123 Main St',
+            state: 'CA',
+            zipCode: '91401'
+          }
+        }
+      ]
+    };
+
+    const first = await httpRequest(port, 'POST', '/api/v1/browser/spass_user/ingest', {
+      body: { format: 'browser-logins-json', payload: bundlePayload },
+      token: rootToken
+    });
+    expect(first.status).toBe(200);
+    expect(first.body.detectedFormat).toBe('browser-logins-json');
+    expect(first.body.mutated).toBe(4);
+    expect(first.body.skippedUnchanged).toBe(0);
+    expect(first.body.rejected).toBe(0);
+    expect(first.body.targetPaths).toEqual([
+      'winome/spass_user/logins',
+      'winome/spass_user/sensitive-forms'
+    ]);
+
+    const stateFile = path.join(tmpDir, 'vault-state.json');
+    const statBefore = fs.statSync(stateFile);
+    await new Promise((r) => setTimeout(r, 25));
+
+    const second = await httpRequest(port, 'POST', '/api/v1/browser/spass_user/ingest', {
+      body: { format: 'browser-logins-json', payload: bundlePayload },
+      token: rootToken
+    });
+    expect(second.status).toBe(200);
+    expect(second.body.mutated).toBe(0);
+    expect(second.body.skippedUnchanged).toBe(4);
+
+    const statAfter = fs.statSync(stateFile);
+    expect(statAfter.mtimeMs).toBe(statBefore.mtimeMs);
+
+    const listForms = await httpRequest(port, 'GET', '/api/v1/browser/spass_user/sensitive-forms', {
+      token: rootToken
+    });
+    expect(listForms.status).toBe(200);
+    expect(listForms.body.count).toBe(3);
+
+    const batchDirect = await httpRequest(port, 'POST', '/api/v1/browser/spass_user/sensitive-forms/batch', {
+      body: { items: bundlePayload.sensitiveForms },
+      token: rootToken
+    });
+    expect(batchDirect.status).toBe(200);
+    expect(batchDirect.body.mutated).toBe(0);
+    expect(batchDirect.body.skippedUnchanged).toBe(3);
+  });
 });

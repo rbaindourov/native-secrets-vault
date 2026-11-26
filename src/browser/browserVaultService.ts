@@ -523,13 +523,12 @@ export class BrowserVaultService {
     return res;
   }
 
-  public upsertSensitiveForm(
-    rawToken: string,
-    rawUserId: string,
-    input: SensitiveFormInput
+  private buildSensitiveFormRecord(
+    input: SensitiveFormInput,
+    nowIso: string,
+    existingCreatedAt?: string,
+    deterministicId = false
   ): SensitiveFormRecord {
-    this.ensureUnsealedOrClearCaches();
-    const userId = sanitizeVaultUserId(rawUserId);
     const allowedCategories: SensitiveFormCategory[] = [
       'payment_card',
       'identity_document',
@@ -549,22 +548,13 @@ export class BrowserVaultService {
     const id =
       input.id && /^[a-zA-Z0-9_-]{4,64}$/.test(input.id)
         ? input.id
+        : deterministicId
+        ? `sform_${crypto
+            .createHash('sha256')
+            .update(`${input.category}|${label.toLowerCase()}`, 'utf8')
+            .digest('hex')
+            .slice(0, 16)}`
         : `sform_${crypto.randomBytes(8).toString('hex')}`;
-
-    const secretPath = `winome/${userId}/sensitive-forms/${id}`;
-    const nowIso = new Date().toISOString();
-    let createdAt = nowIso;
-    const cachedForms = this.sensitiveCacheByUser.get(userId);
-    if (cachedForms?.get(secretPath)?.record?.createdAt) {
-      createdAt = cachedForms.get(secretPath)!.record.createdAt;
-    } else {
-      try {
-        const existing = this.engine.getSecret(rawToken, secretPath);
-        if (typeof existing.data.createdAt === 'string') {
-          createdAt = existing.data.createdAt;
-        }
-      } catch (_) {}
-    }
 
     const sanitizedFields: Record<string, string> = {};
     for (const [k, v] of Object.entries(input.fields)) {
@@ -573,35 +563,22 @@ export class BrowserVaultService {
       }
     }
 
-    const record: SensitiveFormRecord = {
+    return {
       id,
       category: input.category,
       label,
       fields: sanitizedFields,
-      origins: Array.isArray(input.origins) ? input.origins.map((o) => String(o).trim()) : [],
-      createdAt,
+      origins: Array.isArray(input.origins) ? input.origins.map((o) => String(o).trim()).filter(Boolean) : [],
+      createdAt: existingCreatedAt || nowIso,
       updatedAt: nowIso
     };
-
-    const meta = this.engine.putSecret(
-      rawToken,
-      secretPath,
-      record as unknown as Record<string, unknown>,
-      { merge: false, skipIfUnchanged: true }
-    );
-    if (cachedForms) {
-      cachedForms.set(secretPath, { version: meta.version, record });
-    }
-    return record;
   }
 
-  public listSensitiveForms(
+  private getHydratedSensitiveForms(
     rawToken: string,
-    rawUserId: string,
-    category?: string
-  ): SensitiveFormRecord[] {
+    userId: string
+  ): Map<string, CachedVersionedItem<SensitiveFormRecord>> {
     this.ensureUnsealedOrClearCaches();
-    const userId = sanitizeVaultUserId(rawUserId);
     const prefix = `winome/${userId}/sensitive-forms`;
     this.engine.authorize(rawToken, `${prefix}/*`, 'read');
     const entries = this.engine.listPaths(rawToken, prefix);
@@ -636,6 +613,120 @@ export class BrowserVaultService {
         if (!activePaths.has(k)) userMap.delete(k);
       }
     }
+    return userMap;
+  }
+
+  public upsertSensitiveForm(
+    rawToken: string,
+    rawUserId: string,
+    input: SensitiveFormInput
+  ): SensitiveFormRecord {
+    this.ensureUnsealedOrClearCaches();
+    const userId = sanitizeVaultUserId(rawUserId);
+    const nowIso = new Date().toISOString();
+    const preliminary = this.buildSensitiveFormRecord(input, nowIso);
+    const secretPath = `winome/${userId}/sensitive-forms/${preliminary.id}`;
+
+    let createdAt = nowIso;
+    const cachedForms = this.sensitiveCacheByUser.get(userId);
+    if (cachedForms?.get(secretPath)?.record?.createdAt) {
+      createdAt = cachedForms.get(secretPath)!.record.createdAt;
+    } else {
+      try {
+        const existing = this.engine.getSecret(rawToken, secretPath);
+        if (typeof existing.data.createdAt === 'string') {
+          createdAt = existing.data.createdAt;
+        }
+      } catch (_) {}
+    }
+
+    const record: SensitiveFormRecord = { ...preliminary, createdAt };
+    const meta = this.engine.putSecret(
+      rawToken,
+      secretPath,
+      record as unknown as Record<string, unknown>,
+      { merge: false, skipIfUnchanged: true }
+    );
+    if (cachedForms) {
+      cachedForms.set(secretPath, { version: meta.version, record });
+    }
+    return record;
+  }
+
+  /**
+   * Batch sensitive-form upsert (cards, addresses, non-web app entries) in one
+   * SHA-256 deduplicated commit with zero N+1 disk flushes.
+   */
+  public upsertSensitiveFormsBatch(
+    rawToken: string,
+    rawUserId: string,
+    inputs: SensitiveFormInput[]
+  ): { upserted: number; mutated: number; skippedUnchanged: number; entries: SensitiveFormRecord[] } {
+    this.ensureUnsealedOrClearCaches();
+    const userId = sanitizeVaultUserId(rawUserId);
+    if (!Array.isArray(inputs) || inputs.length === 0) {
+      return { upserted: 0, mutated: 0, skippedUnchanged: 0, entries: [] };
+    }
+    if (inputs.length > MAX_BATCH_UPSERT) {
+      throw new Error(`Batch size ${inputs.length} exceeds maximum chunk size of ${MAX_BATCH_UPSERT}`);
+    }
+
+    const userMap = this.getHydratedSensitiveForms(rawToken, userId);
+    const nowIso = new Date().toISOString();
+    const dedupedByPath = new Map<string, { secretPath: string; record: SensitiveFormRecord }>();
+
+    for (const input of inputs) {
+      const prelim = this.buildSensitiveFormRecord(input, nowIso, undefined, true);
+      const secretPath = `winome/${userId}/sensitive-forms/${prelim.id}`;
+      const existingCreatedAt = userMap.get(secretPath)?.record?.createdAt || nowIso;
+      dedupedByPath.set(secretPath, {
+        secretPath,
+        record: { ...prelim, createdAt: existingCreatedAt }
+      });
+    }
+
+    const built = Array.from(dedupedByPath.values());
+    const writes = built.map((b) => ({
+      path: b.secretPath,
+      data: b.record as unknown as Record<string, unknown>,
+      merge: false,
+      skipIfUnchanged: true
+    }));
+
+    const writeResults = this.engine.putSecretsBatch(
+      rawToken,
+      writes,
+      'browser.sensitive_forms.ingest_batch'
+    );
+    let mutated = 0;
+    let skippedUnchanged = 0;
+    for (let i = 0; i < built.length; i++) {
+      if (writeResults[i].unchanged) {
+        skippedUnchanged++;
+      } else {
+        mutated++;
+      }
+      userMap.set(built[i].secretPath, {
+        version: writeResults[i].version,
+        record: built[i].record
+      });
+    }
+
+    return {
+      upserted: mutated,
+      mutated,
+      skippedUnchanged,
+      entries: built.map((b) => b.record)
+    };
+  }
+
+  public listSensitiveForms(
+    rawToken: string,
+    rawUserId: string,
+    category?: string
+  ): SensitiveFormRecord[] {
+    const userId = sanitizeVaultUserId(rawUserId);
+    const userMap = this.getHydratedSensitiveForms(rawToken, userId);
 
     const out: SensitiveFormRecord[] = [];
     for (const { record: rec } of userMap.values()) {

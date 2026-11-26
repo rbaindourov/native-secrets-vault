@@ -22,6 +22,7 @@ import { NativeSecretsVaultEngine, normalizeSecretPath } from '../storage/vaultE
 import {
   BrowserLoginInput,
   BrowserVaultService,
+  SensitiveFormInput,
   sanitizeVaultUserId
 } from '../browser/browserVaultService';
 
@@ -188,7 +189,7 @@ function detectFormat(req: SmartIngestRequest): Exclude<SmartIngestFormat, 'auto
   }
   if (p !== null && typeof p === 'object') {
     const obj = p as Record<string, unknown>;
-    if (Array.isArray(obj.logins) || Array.isArray(obj.items)) {
+    if (Array.isArray(obj.logins) || Array.isArray(obj.items) || Array.isArray(obj.sensitiveForms)) {
       return 'browser-logins-json';
     }
     if (typeof obj.csv === 'string') {
@@ -207,7 +208,10 @@ function detectFormat(req: SmartIngestRequest): Exclude<SmartIngestFormat, 'auto
   if (str.startsWith('[') || str.startsWith('{')) {
     const parsed = JSON.parse(str);
     if (Array.isArray(parsed)) return 'browser-logins-json';
-    if (parsed && (Array.isArray(parsed.logins) || Array.isArray(parsed.items))) {
+    if (
+      parsed &&
+      (Array.isArray(parsed.logins) || Array.isArray(parsed.items) || Array.isArray(parsed.sensitiveForms))
+    ) {
       return 'browser-logins-json';
     }
     return 'kv-bundle-json';
@@ -245,8 +249,16 @@ export class SmartIngestService {
     }
 
     if (format === 'browser-logins-json') {
-      const arr = this.extractLoginsArray(request.payload);
-      return this.ingestBrowserLoginsArray(rawToken, request.userId || 'default', arr, dryRun);
+      const { logins, sensitiveForms } = this.extractBrowserPayload(request.payload);
+      return this.ingestBrowserLoginsArray(
+        rawToken,
+        request.userId || 'default',
+        logins,
+        dryRun,
+        'browser-logins-json',
+        [],
+        sensitiveForms
+      );
     }
 
     if (format === 'dotenv') {
@@ -270,20 +282,30 @@ export class SmartIngestService {
     );
   }
 
-  private extractLoginsArray(payload: unknown): BrowserLoginInput[] {
-    if (Array.isArray(payload)) return payload as BrowserLoginInput[];
-    if (typeof payload === 'string') {
-      const parsed = JSON.parse(payload);
-      if (Array.isArray(parsed)) return parsed as BrowserLoginInput[];
-      if (Array.isArray(parsed?.logins)) return parsed.logins as BrowserLoginInput[];
-      if (Array.isArray(parsed?.items)) return parsed.items as BrowserLoginInput[];
+  private extractBrowserPayload(payload: unknown): {
+    logins: BrowserLoginInput[];
+    sensitiveForms: SensitiveFormInput[];
+  } {
+    let parsed = payload;
+    if (typeof parsed === 'string') {
+      parsed = JSON.parse(parsed);
     }
-    if (payload && typeof payload === 'object') {
-      const obj = payload as Record<string, unknown>;
-      if (Array.isArray(obj.logins)) return obj.logins as BrowserLoginInput[];
-      if (Array.isArray(obj.items)) return obj.items as BrowserLoginInput[];
+    if (Array.isArray(parsed)) {
+      return { logins: parsed as BrowserLoginInput[], sensitiveForms: [] };
     }
-    return [];
+    if (parsed && typeof parsed === 'object') {
+      const obj = parsed as Record<string, unknown>;
+      const logins = Array.isArray(obj.logins)
+        ? (obj.logins as BrowserLoginInput[])
+        : Array.isArray(obj.items)
+        ? (obj.items as BrowserLoginInput[])
+        : [];
+      const sensitiveForms = Array.isArray(obj.sensitiveForms)
+        ? (obj.sensitiveForms as SensitiveFormInput[])
+        : [];
+      return { logins, sensitiveForms };
+    }
+    return { logins: [], sensitiveForms: [] };
   }
 
   private ingestCsvLogins(
@@ -367,7 +389,8 @@ export class SmartIngestService {
     inputs: BrowserLoginInput[],
     dryRun: boolean,
     detectedFormat: 'csv' | 'browser-logins-json' = 'browser-logins-json',
-    preErrors: Array<{ index: number; reason: string }> = []
+    preErrors: Array<{ index: number; reason: string }> = [],
+    sensitiveInputs: SensitiveFormInput[] = []
   ): SmartIngestReport {
     const userId = sanitizeVaultUserId(rawUserId);
     const sanitized: BrowserLoginInput[] = [];
@@ -381,34 +404,72 @@ export class SmartIngestService {
       sanitized.push(item);
     });
 
-    const totalInputItems = sanitized.length + errors.length;
-    const namespacePrefix = `winome/${userId}/logins`;
+    const sanitizedForms: SensitiveFormInput[] = [];
+    const allowedCategories = new Set(['payment_card', 'identity_document', 'secret_field']);
+    sensitiveInputs.forEach((form, idx) => {
+      if (
+        !form ||
+        !allowedCategories.has(String(form.category || '')) ||
+        !String(form.label || '').trim() ||
+        !form.fields ||
+        typeof form.fields !== 'object' ||
+        Object.keys(form.fields).length === 0
+      ) {
+        errors.push({ index: inputs.length + idx, reason: 'Invalid sensitiveForm entry' });
+        return;
+      }
+      sanitizedForms.push(form);
+    });
 
-    if (dryRun || sanitized.length === 0) {
-      this.engine.authorize(rawToken, `${namespacePrefix}/*`, 'write');
+    const totalInputItems = sanitized.length + sanitizedForms.length + errors.length;
+    const loginsPrefix = `winome/${userId}/logins`;
+    const formsPrefix = `winome/${userId}/sensitive-forms`;
+    const targetPaths: string[] = [];
+    if (sanitized.length > 0) targetPaths.push(loginsPrefix);
+    if (sanitizedForms.length > 0) targetPaths.push(formsPrefix);
+
+    if (dryRun || (sanitized.length === 0 && sanitizedForms.length === 0)) {
+      if (sanitized.length > 0 || sanitizedForms.length === 0) {
+        this.engine.authorize(rawToken, `${loginsPrefix}/*`, 'write');
+      }
+      if (sanitizedForms.length > 0) {
+        this.engine.authorize(rawToken, `${formsPrefix}/*`, 'write');
+      }
       return {
         ok: true,
         detectedFormat,
         dryRun,
         totalInputItems,
-        mutated: dryRun ? sanitized.length : 0,
+        mutated: dryRun ? sanitized.length + sanitizedForms.length : 0,
         skippedUnchanged: 0,
         rejected: errors.length,
-        targetPaths: sanitized.length > 0 ? [namespacePrefix] : [],
+        targetPaths,
         errors
       };
     }
 
-    const batchRes = this.browserVault.upsertLoginsBatch(rawToken, userId, sanitized);
+    let mutated = 0;
+    let skippedUnchanged = 0;
+    if (sanitized.length > 0) {
+      const loginRes = this.browserVault.upsertLoginsBatch(rawToken, userId, sanitized);
+      mutated += loginRes.mutated;
+      skippedUnchanged += loginRes.skippedUnchanged;
+    }
+    if (sanitizedForms.length > 0) {
+      const formRes = this.browserVault.upsertSensitiveFormsBatch(rawToken, userId, sanitizedForms);
+      mutated += formRes.mutated;
+      skippedUnchanged += formRes.skippedUnchanged;
+    }
+
     return {
       ok: true,
       detectedFormat,
       dryRun: false,
       totalInputItems,
-      mutated: batchRes.mutated,
-      skippedUnchanged: batchRes.skippedUnchanged,
+      mutated,
+      skippedUnchanged,
       rejected: errors.length,
-      targetPaths: [namespacePrefix],
+      targetPaths,
       errors
     };
   }
