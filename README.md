@@ -33,6 +33,9 @@ Built with **zero runtime npm dependencies** (100% Node.js native `crypto`, `htt
 7. **Smart Batch Ingest, SHA-256 Content Deduplication & Version Pruning**:
    - Unified ingest endpoints (`POST /api/v1/ingest/smart` and `POST /api/v1/browser/:userId/ingest`) accept RFC-4180 browser password CSVs (Chrome, Brave, Bitwarden, 1Password), `.env` files (auto-classified into `cms/prod`, `oauth/prod`, `billing/prod`, `email-crm/prod`, `google-apis/prod`, `infra/r7000`), and KV v2 JSON bundles in a single atomic disk commit.
    - SHA-256 canonical content hashing skips unchanged secrets with zero AES-GCM re-encryptions, zero version increments, and zero disk writes, while `maxVersions` automatically bounds historical version retention (`5` for rotating `auth-tokens`, `20` for standard KV paths).
+8. **Multi-Workstation W3C WebAuthn / FIDO2 Passkey Transit Engine (`/api/v1/browser/:userId/passkeys*`)**:
+   - Generates `ES256` (`ECDSA P-256`) and `EdDSA` (`Ed25519`) WebAuthn credentials inside Vault (`winome/<userId>/passkeys/*`) where private signing keys **never leave Vault** (HashiCorp Transit non-exportable signing boundary).
+   - Emits RFC 8949 canonical CBOR `attestationObject` (`fmt: "none"`, zero AAGUID) and multi-device synced flags (`UP | UV | BE | BS`, wire `signCount = 0` per 1Password `passkey-rs` & WebAuthn L3 §6.1.2) while enforcing W3C §13.4.3 RP ID registrable-domain origin validation.
 
 ---
 

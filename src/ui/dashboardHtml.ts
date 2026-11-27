@@ -280,6 +280,10 @@ export function renderVaultDashboardHtml(): string {
         <div class="stat-value" id="stLogins">-</div>
       </div>
       <div class="stat-card">
+        <div class="stat-label">Synced Passkeys</div>
+        <div class="stat-value" id="stPasskeys">-</div>
+      </div>
+      <div class="stat-card">
         <div class="stat-label">Cards / Apps / Docs</div>
         <div class="stat-value" id="stForms">-</div>
       </div>
@@ -354,6 +358,7 @@ export function renderVaultDashboardHtml(): string {
 
         <div class="filter-pills">
           <button class="pill active" data-filter="all" onclick="setPmFilter('all')">All (<span id="cntAll">0</span>)</button>
+          <button class="pill" data-filter="passkeys" onclick="setPmFilter('passkeys')">🔑 Passkeys (<span id="cntPasskeys">0</span>)</button>
           <button class="pill" data-filter="logins" onclick="setPmFilter('logins')">Website Logins (<span id="cntLogins">0</span>)</button>
           <button class="pill" data-filter="totp" onclick="setPmFilter('totp')">Has 2FA (<span id="cntTotp">0</span>)</button>
           <button class="pill" data-filter="android" onclick="setPmFilter('android')">Android Apps (<span id="cntAndroid">0</span>)</button>
@@ -443,6 +448,7 @@ export function renderVaultDashboardHtml(): string {
       tokenInfo: null,
       activeUserId: '',
       logins: [],
+      passkeys: [],
       sensitiveForms: [],
       revealedIds: new Set()
     };
@@ -506,11 +512,13 @@ export function renderVaultDashboardHtml(): string {
       state.tokenInfo = null;
       state.activeUserId = '';
       state.logins = [];
+      state.passkeys = [];
       state.sensitiveForms = [];
       state.revealedIds.clear();
       document.getElementById('pmUnlockPanel').classList.remove('hidden');
       document.getElementById('pmMainPanel').classList.add('hidden');
       document.getElementById('stLogins').textContent = '-';
+      document.getElementById('stPasskeys').textContent = '-';
       document.getElementById('stForms').textContent = '-';
       document.getElementById('pathsList').innerHTML = '<small class="muted">Locked. Unlock above.</small>';
       document.getElementById('auditList').innerHTML = '<small class="muted">Locked.</small>';
@@ -624,8 +632,9 @@ export function renderVaultDashboardHtml(): string {
       sel.value = targetUid;
       document.getElementById('ingestUserId').placeholder = 'User ID (default: ' + targetUid + ')';
 
-      var [loginsRes, formsRes] = await Promise.all([
+      var [loginsRes, passkeysRes, formsRes] = await Promise.all([
         fetch('/api/v1/browser/' + encodeURIComponent(targetUid) + '/logins', { headers: { Authorization: 'Bearer ' + token } }),
+        fetch('/api/v1/browser/' + encodeURIComponent(targetUid) + '/passkeys', { headers: { Authorization: 'Bearer ' + token } }),
         fetch('/api/v1/browser/' + encodeURIComponent(targetUid) + '/sensitive-forms', { headers: { Authorization: 'Bearer ' + token } })
       ]);
 
@@ -636,14 +645,17 @@ export function renderVaultDashboardHtml(): string {
       }
 
       var loginsData = await loginsRes.json();
+      var passkeysData = passkeysRes.ok ? await passkeysRes.json() : { passkeys: [] };
       var formsData = formsRes.ok ? await formsRes.json() : { entries: [] };
       state.logins = Array.isArray(loginsData.logins) ? loginsData.logins : [];
+      state.passkeys = Array.isArray(passkeysData.passkeys) ? passkeysData.passkeys : [];
       state.sensitiveForms = Array.isArray(formsData.entries) ? formsData.entries : [];
 
       document.getElementById('pmUnlockPanel').classList.add('hidden');
       document.getElementById('pmMainPanel').classList.remove('hidden');
       document.getElementById('pmSessionMeta').textContent = '• User ' + targetUid;
       document.getElementById('stLogins').textContent = state.logins.length;
+      document.getElementById('stPasskeys').textContent = state.passkeys.length;
       document.getElementById('stForms').textContent = state.sensitiveForms.length;
 
       updateFilterCounts();
@@ -671,11 +683,13 @@ export function renderVaultDashboardHtml(): string {
 
     function updateFilterCounts() {
       var lCount = state.logins.length;
+      var pkCount = state.passkeys.length;
       var totpCount = state.logins.filter(function(l) { return Boolean(l.hasTotp || l.totpSecret); }).length;
       var androidCount = state.sensitiveForms.filter(isAndroidEntry).length;
       var cardCount = state.sensitiveForms.filter(function(f) { return f.category === 'payment_card'; }).length;
       var idCount = state.sensitiveForms.filter(function(f) { return f.category === 'identity_document' || (f.category === 'secret_field' && !isAndroidEntry(f)); }).length;
-      document.getElementById('cntAll').textContent = lCount + state.sensitiveForms.length;
+      document.getElementById('cntAll').textContent = lCount + pkCount + state.sensitiveForms.length;
+      document.getElementById('cntPasskeys').textContent = pkCount;
       document.getElementById('cntLogins').textContent = lCount;
       document.getElementById('cntTotp').textContent = totpCount;
       document.getElementById('cntAndroid').textContent = androidCount;
@@ -688,7 +702,14 @@ export function renderVaultDashboardHtml(): string {
       var f = state.pmFilter;
 
       var showLogins = f === 'all' || f === 'logins' || f === 'totp';
+      var showPasskeys = f === 'all' || f === 'passkeys';
       var showForms = f === 'all' || f === 'android' || f === 'cards' || f === 'identity';
+
+      var filteredPasskeys = !showPasskeys ? [] : state.passkeys.filter(function(pk) {
+        if (!q) return true;
+        var hay = [pk.rpId, pk.rpName, pk.origin, pk.userName, pk.userDisplayName, pk.credentialId].join(' ').toLowerCase();
+        return hay.indexOf(q) !== -1;
+      });
 
       var filteredLogins = !showLogins ? [] : state.logins.filter(function(l) {
         if (f === 'totp' && !l.hasTotp && !l.totpSecret) return false;
@@ -800,6 +821,51 @@ export function renderVaultDashboardHtml(): string {
 
       var formsWrap = document.getElementById('pmFormsWrap');
       formsWrap.innerHTML = '';
+
+      filteredPasskeys.forEach(function(pk) {
+        var card = document.createElement('div');
+        card.className = 'sform-card';
+        var head = document.createElement('div');
+        head.style.cssText = 'display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px;';
+        var titleWrap = document.createElement('div');
+        var badge = document.createElement('span');
+        badge.className = 'cat-badge';
+        badge.textContent = '🔑 Passkey • ' + (pk.alg === -8 ? 'Ed25519' : 'ES256 P-256');
+        var hTitle = document.createElement('div');
+        hTitle.style.cssText = 'font-weight:700;margin-top:6px;';
+        hTitle.textContent = (pk.userName || pk.userDisplayName || 'Passkey') + ' @ ' + pk.rpId;
+        titleWrap.appendChild(badge);
+        titleWrap.appendChild(hTitle);
+
+        var delBtn = document.createElement('button');
+        delBtn.className = 'btn-danger btn-sm';
+        delBtn.textContent = 'Delete';
+        delBtn.onclick = function() { deletePasskeyItem(pk); };
+        head.appendChild(titleWrap);
+        head.appendChild(delBtn);
+        card.appendChild(head);
+
+        var metaRows = [
+          ['RP ID', pk.rpId],
+          ['Account', pk.userDisplayName && pk.userDisplayName !== pk.userName ? pk.userName + ' (' + pk.userDisplayName + ')' : pk.userName],
+          ['Credential ID', String(pk.credentialId || '').slice(0, 22) + '…'],
+          ['Vault Sync', 'Multi-Workstation (BE+BS • Private Key Non-Exportable)'],
+          ['Sign-Ins', String(pk.usageCount || 0) + ' • Last used ' + String(pk.lastUsedAt || pk.createdAt || '').slice(0, 19).replace('T', ' ')]
+        ];
+        metaRows.forEach(function(pair) {
+          var row = document.createElement('div');
+          row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-top:1px solid rgba(255,255,255,0.06);font-size:0.82rem;';
+          var left = document.createElement('span');
+          left.className = 'muted';
+          left.textContent = pair[0];
+          var right = document.createElement('code');
+          right.textContent = pair[1] || '-';
+          row.appendChild(left);
+          row.appendChild(right);
+          card.appendChild(row);
+        });
+        formsWrap.appendChild(card);
+      });
       filteredForms.forEach(function(sf) {
         var card = document.createElement('div');
         card.className = 'sform-card';
@@ -870,7 +936,7 @@ export function renderVaultDashboardHtml(): string {
         formsWrap.appendChild(card);
       });
 
-      if (filteredLogins.length === 0 && filteredForms.length === 0) {
+      if (filteredLogins.length === 0 && filteredPasskeys.length === 0 && filteredForms.length === 0) {
         var empty = document.createElement('p');
         empty.className = 'muted';
         empty.textContent = 'No matching credentials found.';
@@ -958,6 +1024,19 @@ export function renderVaultDashboardHtml(): string {
       }
     }
 
+    async function deletePasskeyItem(pk) {
+      if (!confirm('Cryptographically delete Vault passkey for ' + pk.rpId + ' (' + (pk.userName || pk.id) + ')?')) return;
+      var token = getToken();
+      var r = await fetch('/api/v1/browser/' + encodeURIComponent(state.activeUserId) + '/passkeys/' + encodeURIComponent(pk.id), {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer ' + token }
+      });
+      if (r.ok) {
+        showToast('Passkey deleted');
+        await loadPasswordsDashboard();
+      }
+    }
+
     function exportFilteredCsv() {
       var q = document.getElementById('pmSearch').value.trim().toLowerCase();
       var rows = state.logins.filter(function(l) {
@@ -990,7 +1069,7 @@ export function renderVaultDashboardHtml(): string {
       var pData = await pRes.json();
       var showBrowser = document.getElementById('chkShowBrowserPaths').checked;
       var list = (pData.paths || []).filter(function(item) {
-        return showBrowser || !/^winome\\/[^/]+\\/(logins|sensitive-forms)\\//.test(item.path);
+        return showBrowser || !/^winome\\/[^/]+\\/(logins|sensitive-forms|passkeys)\\//.test(item.path);
       });
       var listEl = document.getElementById('pathsList');
       listEl.innerHTML = '';

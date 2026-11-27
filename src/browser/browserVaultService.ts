@@ -15,6 +15,18 @@
 import crypto from 'crypto';
 import { URL } from 'url';
 import { NativeSecretsVaultEngine } from '../storage/vaultEngine';
+import {
+  BrowserPasskeySummary,
+  PasskeyAuthenticateRequest,
+  PasskeyAuthenticateResult,
+  PasskeyRegisterRequest,
+  PasskeyRegisterResult,
+  StoredPasskeyRecord,
+  buildPasskeyAssertion,
+  buildPasskeyRegistration,
+  sanitizePasskeySummary,
+  validateRpIdForOrigin
+} from './webauthnPasskey';
 
 export interface BrowserLoginInput {
   id?: string;
@@ -234,6 +246,7 @@ function deterministicCredentialId(origin: string, username: string): string {
 export class BrowserVaultService {
   private readonly loginCacheByUser = new Map<string, Map<string, CachedVersionedItem<BrowserLoginRecord>>>();
   private readonly sensitiveCacheByUser = new Map<string, Map<string, CachedVersionedItem<SensitiveFormRecord>>>();
+  private readonly passkeyCacheByUser = new Map<string, Map<string, CachedVersionedItem<StoredPasskeyRecord>>>();
 
   constructor(private readonly engine: NativeSecretsVaultEngine) {}
 
@@ -241,6 +254,7 @@ export class BrowserVaultService {
     if (this.engine.isSealed()) {
       this.loginCacheByUser.clear();
       this.sensitiveCacheByUser.clear();
+      this.passkeyCacheByUser.clear();
       throw new Error('Vault is sealed');
     }
   }
@@ -815,5 +829,247 @@ export class BrowserVaultService {
       }
       throw err;
     }
+  }
+
+  private getHydratedPasskeys(
+    rawToken: string,
+    userId: string
+  ): Map<string, CachedVersionedItem<StoredPasskeyRecord>> {
+    this.ensureUnsealedOrClearCaches();
+    const prefix = `winome/${userId}/passkeys`;
+    this.engine.authorize(rawToken, `${prefix}/*`, 'read');
+    const entries = this.engine.listPaths(rawToken, prefix);
+
+    let userMap = this.passkeyCacheByUser.get(userId);
+    if (!userMap) {
+      userMap = new Map();
+      const bulk = this.engine.getSecretsByPrefix(rawToken, prefix);
+      for (const item of bulk) {
+        const rec = item.data as unknown as StoredPasskeyRecord;
+        if (rec && rec.credentialId && rec.rpId) {
+          userMap.set(item.path, { version: item.version, record: rec });
+        }
+      }
+      this.passkeyCacheByUser.set(userId, userMap);
+      return userMap;
+    }
+
+    const activePaths = new Set<string>();
+    for (const meta of entries) {
+      activePaths.add(meta.path);
+      const cached = userMap.get(meta.path);
+      if (!cached || cached.version !== meta.currentVersion) {
+        try {
+          const { data, metadata } = this.engine.getSecret(rawToken, meta.path);
+          const rec = data as unknown as StoredPasskeyRecord;
+          if (rec && rec.credentialId && rec.rpId) {
+            userMap.set(meta.path, { version: metadata.version, record: rec });
+          }
+        } catch (_) {}
+      }
+    }
+    for (const k of Array.from(userMap.keys())) {
+      if (!activePaths.has(k)) {
+        userMap.delete(k);
+      }
+    }
+    return userMap;
+  }
+
+  public listPasskeys(
+    rawToken: string,
+    rawUserId: string,
+    filter: { origin?: string; rpId?: string } = {}
+  ): BrowserPasskeySummary[] {
+    const userId = sanitizeVaultUserId(rawUserId);
+    const userMap = this.getHydratedPasskeys(rawToken, userId);
+
+    let targetRpId = filter.rpId ? String(filter.rpId).trim().toLowerCase().replace(/\.+$/, '') : '';
+    let originHost = '';
+    if (filter.origin && filter.origin.trim()) {
+      const norm = normalizeOriginUrl(filter.origin);
+      originHost = norm.hostname;
+      if (targetRpId) {
+        const validated = validateRpIdForOrigin(targetRpId, norm.origin);
+        targetRpId = validated.effectiveRpId;
+      }
+    }
+
+    const out: BrowserPasskeySummary[] = [];
+    for (const { record: rec } of userMap.values()) {
+      if (!rec || !rec.rpId || !rec.credentialId) continue;
+      const recRp = rec.rpId.toLowerCase();
+
+      let matchType: BrowserPasskeySummary['matchType'] = 'all';
+      if (targetRpId) {
+        if (recRp !== targetRpId) continue;
+        matchType = 'exact_rpid';
+      } else if (originHost) {
+        if (originHost === recRp) {
+          matchType = 'exact_rpid';
+        } else if (originHost.endsWith(`.${recRp}`)) {
+          matchType = 'parent_rpid';
+        } else {
+          continue;
+        }
+      }
+
+      out.push(sanitizePasskeySummary(rec, matchType));
+    }
+
+    return out.sort((a, b) => {
+      if (a.matchType !== b.matchType) {
+        if (a.matchType === 'exact_rpid') return -1;
+        if (b.matchType === 'exact_rpid') return 1;
+      }
+      return (b.lastUsedAt || b.updatedAt || '').localeCompare(a.lastUsedAt || a.updatedAt || '');
+    });
+  }
+
+  public registerPasskey(
+    rawToken: string,
+    rawUserId: string,
+    input: PasskeyRegisterRequest
+  ): PasskeyRegisterResult {
+    this.ensureUnsealedOrClearCaches();
+    const userId = sanitizeVaultUserId(rawUserId);
+    const { normalizedOrigin, effectiveRpId } = validateRpIdForOrigin(input.rpId, input.origin);
+    const { registrableDomain } = normalizeOriginUrl(normalizedOrigin);
+
+    const userMap = this.getHydratedPasskeys(rawToken, userId);
+    const excludedSet = new Set(
+      (input.excludeCredentialIds || []).map((id) => String(id || '').trim()).filter(Boolean)
+    );
+
+    if (excludedSet.size > 0) {
+      for (const { record: existing } of userMap.values()) {
+        if (
+          existing.rpId.toLowerCase() === effectiveRpId &&
+          excludedSet.has(existing.credentialId)
+        ) {
+          throw new Error(
+            `InvalidStateError: Passkey ${existing.credentialId} is already registered in Vault for ${effectiveRpId}`
+          );
+        }
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    const { storedRecord, response } = buildPasskeyRegistration(
+      { ...input, origin: normalizedOrigin, rpId: effectiveRpId },
+      registrableDomain,
+      nowIso
+    );
+
+    const secretPath = `winome/${userId}/passkeys/${storedRecord.id}`;
+    const meta = this.engine.putSecret(
+      rawToken,
+      secretPath,
+      storedRecord as unknown as Record<string, unknown>,
+      { merge: false, skipIfUnchanged: true, maxVersions: 5 }
+    );
+    userMap.set(secretPath, { version: meta.version, record: storedRecord });
+
+    return response;
+  }
+
+  public authenticatePasskey(
+    rawToken: string,
+    rawUserId: string,
+    input: PasskeyAuthenticateRequest
+  ): PasskeyAuthenticateResult {
+    this.ensureUnsealedOrClearCaches();
+    const userId = sanitizeVaultUserId(rawUserId);
+    const { normalizedOrigin, effectiveRpId } = validateRpIdForOrigin(input.rpId, input.origin);
+    const userMap = this.getHydratedPasskeys(rawToken, userId);
+
+    const allowSet = new Set(
+      (input.allowCredentialIds || []).map((id) => String(id || '').trim()).filter(Boolean)
+    );
+    const requestedCredId = input.credentialId ? String(input.credentialId).trim() : '';
+
+    const candidates: Array<{ secretPath: string; record: StoredPasskeyRecord }> = [];
+    for (const [secretPath, { record: rec }] of userMap.entries()) {
+      if (!rec || rec.rpId.toLowerCase() !== effectiveRpId) continue;
+      if (requestedCredId && rec.credentialId !== requestedCredId && rec.id !== requestedCredId) {
+        continue;
+      }
+      if (allowSet.size > 0 && !allowSet.has(rec.credentialId)) {
+        continue;
+      }
+      candidates.push({ secretPath, record: rec });
+    }
+
+    if (candidates.length === 0) {
+      throw new Error(`NotAllowedError: Matching passkey not found in Vault for ${effectiveRpId}`);
+    }
+
+    candidates.sort((a, b) =>
+      (b.record.lastUsedAt || b.record.updatedAt || '').localeCompare(
+        a.record.lastUsedAt || a.record.updatedAt || ''
+      )
+    );
+    const chosen = candidates[0];
+
+    const signed = buildPasskeyAssertion(chosen.record, {
+      ...input,
+      origin: normalizedOrigin,
+      rpId: effectiveRpId
+    });
+
+    const nowIso = new Date().toISOString();
+    const updatedRecord: StoredPasskeyRecord = {
+      ...chosen.record,
+      usageCount: (Number(chosen.record.usageCount) || 0) + 1,
+      updatedAt: nowIso,
+      lastUsedAt: nowIso
+    };
+
+    const meta = this.engine.putSecret(
+      rawToken,
+      chosen.secretPath,
+      updatedRecord as unknown as Record<string, unknown>,
+      { merge: false, skipIfUnchanged: true, maxVersions: 5 }
+    );
+    userMap.set(chosen.secretPath, { version: meta.version, record: updatedRecord });
+
+    return {
+      passkey: sanitizePasskeySummary(updatedRecord, 'exact_rpid'),
+      assertion: {
+        id: updatedRecord.credentialId,
+        rawIdBase64Url: updatedRecord.credentialId,
+        type: 'public-key',
+        authenticatorAttachment: 'platform',
+        clientDataJSONBase64Url: signed.clientDataJSONBase64Url,
+        authenticatorDataBase64Url: signed.authenticatorDataBase64Url,
+        signatureBase64Url: signed.signatureBase64Url,
+        userHandleBase64Url: updatedRecord.userHandleBase64Url,
+        clientExtensionResults: {}
+      }
+    };
+  }
+
+  public deletePasskey(rawToken: string, rawUserId: string, passkeyIdOrCredentialId: string) {
+    this.ensureUnsealedOrClearCaches();
+    const userId = sanitizeVaultUserId(rawUserId);
+    const cleanTarget = String(passkeyIdOrCredentialId || '').trim();
+    if (!cleanTarget || !/^[a-zA-Z0-9_-]{4,128}$/.test(cleanTarget)) {
+      throw new Error('Invalid passkey identifier');
+    }
+
+    const userMap = this.getHydratedPasskeys(rawToken, userId);
+    let targetPath = `winome/${userId}/passkeys/${cleanTarget}`;
+    if (!userMap.has(targetPath)) {
+      for (const [p, { record }] of userMap.entries()) {
+        if (record.id === cleanTarget || record.credentialId === cleanTarget) {
+          targetPath = p;
+          break;
+        }
+      }
+    }
+
+    const res = this.engine.deleteSecret(rawToken, targetPath);
+    userMap.delete(targetPath);
+    return res;
   }
 }

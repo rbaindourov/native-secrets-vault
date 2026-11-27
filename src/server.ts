@@ -661,6 +661,42 @@ export function createVaultServer(options: VaultServerOptions = {}) {
           sendJson(res, 200, { ok: true, integrations });
           return;
         }
+
+        if (subRoute === 'passkeys' && method === 'GET') {
+          const originFilter = parsedUrl.searchParams.get('origin') || undefined;
+          const rpIdFilter = parsedUrl.searchParams.get('rpId') || undefined;
+          const passkeys = browserVault.listPasskeys(token, userId, {
+            origin: originFilter,
+            rpId: rpIdFilter
+          });
+          sendJson(res, 200, { ok: true, count: passkeys.length, passkeys });
+          return;
+        }
+
+        if (subRoute === 'passkeys/register' && method === 'POST') {
+          const body = await readJsonBody(req);
+          const registered = browserVault.registerPasskey(token, userId, body as any);
+          sendJson(res, 201, { ok: true, ...registered });
+          return;
+        }
+
+        if (subRoute === 'passkeys/authenticate' && method === 'POST') {
+          const body = await readJsonBody(req);
+          const authenticated = browserVault.authenticatePasskey(token, userId, body as any);
+          sendJson(res, 200, { ok: true, ...authenticated });
+          return;
+        }
+
+        const passkeyDeleteMatch = subRoute.match(/^passkeys\/([^/]+)$/);
+        if (passkeyDeleteMatch && method === 'DELETE') {
+          const deleted = browserVault.deletePasskey(
+            token,
+            userId,
+            decodeURIComponent(passkeyDeleteMatch[1])
+          );
+          sendJson(res, 200, { ok: true, ...deleted });
+          return;
+        }
       }
 
       if (method === 'POST' && pathname === '/api/v1/snapshot/export') {
@@ -680,7 +716,9 @@ export function createVaultServer(options: VaultServerOptions = {}) {
       const msg = err?.message || 'Internal Vault Error';
       const status = msg.startsWith('Permission denied')
         ? 403
-        : msg.includes('not found')
+        : msg.startsWith('InvalidStateError:')
+        ? 409
+        : msg.startsWith('NotAllowedError:') || msg.includes('not found')
         ? 404
         : msg.includes('sealed') || msg.includes('not initialized')
         ? 503
