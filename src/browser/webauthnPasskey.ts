@@ -28,11 +28,12 @@
 import crypto from 'crypto';
 import { URL } from 'url';
 
-export type SupportedCoseAlg = -7 | -8; // -7 = ES256 (ECDSA P-256 + SHA-256), -8 = EdDSA (Ed25519)
+export type SupportedCoseAlg = -7 | -8 | -257; // -7 = ES256 (ECDSA P-256), -8 = EdDSA (Ed25519), -257 = RS256 (RSA-2048)
 
 export interface StoredPasskeyRecord {
   id: string;
   credentialId: string; // base64url rawId
+  label?: string;
   rpId: string;
   rpName: string;
   origin: string;
@@ -316,7 +317,7 @@ export function selectCoseAlgorithm(
   }
   for (const param of pubKeyCredParams) {
     if (param && (!param.type || param.type === 'public-key')) {
-      if (param.alg === -7 || param.alg === -8) {
+      if (param.alg === -7 || param.alg === -8 || param.alg === -257) {
         return param.alg;
       }
     }
@@ -324,7 +325,7 @@ export function selectCoseAlgorithm(
   throw new Error(
     `NotSupportedError: None of the requested pubKeyCredParams algorithms (${pubKeyCredParams
       .map((p) => p?.alg)
-      .join(', ')}) are supported (supported: -7 ES256, -8 EdDSA)`
+      .join(', ')}) are supported (supported: -7 ES256, -8 EdDSA, -257 RS256)`
   );
 }
 
@@ -423,20 +424,47 @@ function generateWebAuthnKeyMaterial(alg: SupportedCoseAlg): {
     };
   }
 
-  // alg === -8 (EdDSA / Ed25519)
-  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  if (alg === -8) {
+    // EdDSA / Ed25519
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const pkcs8Der = privateKey.export({ type: 'pkcs8', format: 'der' }) as Buffer;
+    const spkiDer = publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
+    const jwk = publicKey.export({ format: 'jwk' }) as { x?: string };
+    if (!jwk.x) {
+      throw new Error('Failed to export Ed25519 JWK public key');
+    }
+    const xBuf = padCoord32(fromBase64Url(jwk.x), 'Ed25519 x');
+    const coseMap = new Map<number, unknown>([
+      [1, 1], // kty: OKP
+      [3, -8], // alg: EdDSA
+      [-1, 6], // crv: Ed25519
+      [-2, xBuf]
+    ]);
+    return {
+      privateKeyPkcs8Base64: pkcs8Der.toString('base64'),
+      publicKeySpkiBase64Url: toBase64Url(spkiDer),
+      cosePublicKey: encodeCbor(coseMap)
+    };
+  }
+
+  // alg === -257 (RS256 / RSASSA-PKCS1-v1_5 with SHA-256, 2048-bit RSA)
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicExponent: 0x10001
+  });
   const pkcs8Der = privateKey.export({ type: 'pkcs8', format: 'der' }) as Buffer;
   const spkiDer = publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
-  const jwk = publicKey.export({ format: 'jwk' }) as { x?: string };
-  if (!jwk.x) {
-    throw new Error('Failed to export Ed25519 JWK public key');
+  const jwk = publicKey.export({ format: 'jwk' }) as { n?: string; e?: string };
+  if (!jwk.n || !jwk.e) {
+    throw new Error('Failed to export RSA-2048 JWK modulus/exponent');
   }
-  const xBuf = padCoord32(fromBase64Url(jwk.x), 'Ed25519 x');
+  const nBuf = fromBase64Url(jwk.n);
+  const eBuf = fromBase64Url(jwk.e);
   const coseMap = new Map<number, unknown>([
-    [1, 1], // kty: OKP
-    [3, -8], // alg: EdDSA
-    [-1, 6], // crv: Ed25519
-    [-2, xBuf]
+    [1, 3], // kty: RSA (RFC 8230)
+    [3, -257], // alg: RS256 (RFC 8812)
+    [-1, nBuf], // n: modulus
+    [-2, eBuf] // e: public exponent
   ]);
   return {
     privateKeyPkcs8Base64: pkcs8Der.toString('base64'),
@@ -595,6 +623,8 @@ export function buildPasskeyAssertion(
   const signature =
     record.alg === -8
       ? crypto.sign(null, signedPayload, privateKey)
+      : record.alg === -257
+      ? crypto.sign('sha256', signedPayload, privateKey)
       : crypto.sign('sha256', signedPayload, { key: privateKey, dsaEncoding: 'der' });
 
   return {

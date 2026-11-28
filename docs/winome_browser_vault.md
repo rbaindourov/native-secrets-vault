@@ -14,6 +14,7 @@
 ## KV v2 Path Hierarchy
 
 - `winome/<userId>/logins/<credentialId>` — Website logins (`origin`, `registrableDomain`, `signonRealm`, `username`, `password`, optional `totpSecret`, `formAction`, `urls`, `notes`).
+- `winome/<userId>/passkeys/<passkeyId>` — Multi-workstation synced W3C WebAuthn Level 3 / FIDO2 passkeys (`ES256` `-7`, `EdDSA` `-8`, `RS256` `-257`). PKCS#8 private keys are encrypted at rest with AES-256-GCM and **never** leave Vault (`Transit`-style signing).
 - `winome/<userId>/sensitive-forms/<entryId>` — Sensitive form secrets (`payment_card`, `identity_document`, `secret_field`) rejected from standard `users_backend` autofill sync.
 - `winome/<userId>/auth-tokens/<domain>` — Portable encrypted session cookies & bearer headers.
 - `winome/<userId>/integrations` — Per-user ABM workbench credentials (`crmApiKey`, `cmsPitchApiKey`, `campaignsApiKey`).
@@ -38,3 +39,9 @@
 | `DELETE` | `/api/v1/browser/:userId/sensitive-forms/:entryId` | Destroy a sensitive form entry |
 | `GET/PUT` | `/api/v1/browser/:userId/auth-tokens/:domain` | Read or store encrypted session cookies/tokens for a domain |
 | `GET/PUT` | `/api/v1/browser/:userId/integrations` | Read or store ABM/CRM/CMS API keys for zero-manual-config browser bootstrap |
+| `GET` | `/api/v1/browser/:userId/passkeys?origin=...&rpId=...` | List synced WebAuthn passkeys (public metadata only; private keys stripped) |
+| `POST` | `/api/v1/browser/:userId/passkeys/register` | Generate P-256 (`-7`), Ed25519 (`-8`), or RSA-2048 (`-257`) keypair inside Vault and return CBOR `attestationObject` (`fmt: "none"`, `flags: 0x5d`) |
+| `POST` | `/api/v1/browser/:userId/passkeys/authenticate` | Sign `authenticatorData || SHA256(clientDataJSON)` inside Vault (`flags: 0x1d`) without exposing PKCS#8 key material |
+| `POST` | `/api/v1/browser/:userId/passkeys/signal` | Apply W3C WebAuthn Signal API updates (`unknownCredential`, `allAcceptedCredentials`, `currentUserDetails`) with RP ID & Base64URL enforcement |
+| `PUT` | `/api/v1/browser/:userId/passkeys/:passkeyId` | Rename passkey label or synchronize account display metadata |
+| `DELETE` | `/api/v1/browser/:userId/passkeys/:passkeyId` | Cryptographically shred passkey record and audit deletion |

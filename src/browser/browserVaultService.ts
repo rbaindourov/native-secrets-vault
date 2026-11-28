@@ -1072,4 +1072,158 @@ export class BrowserVaultService {
     userMap.delete(targetPath);
     return res;
   }
+
+  public updatePasskey(
+    rawToken: string,
+    rawUserId: string,
+    passkeyIdOrCredentialId: string,
+    updates: { label?: string; userName?: string; userDisplayName?: string }
+  ): BrowserPasskeySummary {
+    this.ensureUnsealedOrClearCaches();
+    const userId = sanitizeVaultUserId(rawUserId);
+    const cleanTarget = String(passkeyIdOrCredentialId || '').trim();
+    if (!cleanTarget || !/^[a-zA-Z0-9_-]{4,128}$/.test(cleanTarget)) {
+      throw new Error('Invalid passkey identifier');
+    }
+
+    const userMap = this.getHydratedPasskeys(rawToken, userId);
+    let targetEntry: { secretPath: string; record: StoredPasskeyRecord } | null = null;
+    const directPath = `winome/${userId}/passkeys/${cleanTarget}`;
+    const directHit = userMap.get(directPath);
+    if (directHit) {
+      targetEntry = { secretPath: directPath, record: directHit.record };
+    } else {
+      for (const [p, { record }] of userMap.entries()) {
+        if (record.id === cleanTarget || record.credentialId === cleanTarget) {
+          targetEntry = { secretPath: p, record };
+          break;
+        }
+      }
+    }
+
+    if (!targetEntry) {
+      throw new Error(`Passkey not found: ${cleanTarget}`);
+    }
+
+    const nowIso = new Date().toISOString();
+    const updatedRecord: StoredPasskeyRecord = {
+      ...targetEntry.record,
+      ...(typeof updates.label === 'string' ? { label: updates.label.trim() } : {}),
+      ...(typeof updates.userName === 'string' && updates.userName.trim()
+        ? { userName: updates.userName.trim() }
+        : {}),
+      ...(typeof updates.userDisplayName === 'string' && updates.userDisplayName.trim()
+        ? { userDisplayName: updates.userDisplayName.trim() }
+        : {}),
+      updatedAt: nowIso
+    };
+
+    const meta = this.engine.putSecret(
+      rawToken,
+      targetEntry.secretPath,
+      updatedRecord as unknown as Record<string, unknown>,
+      { merge: false, skipIfUnchanged: true, maxVersions: 5 }
+    );
+    userMap.set(targetEntry.secretPath, { version: meta.version, record: updatedRecord });
+    return sanitizePasskeySummary(updatedRecord);
+  }
+
+  public signalPasskeys(
+    rawToken: string,
+    rawUserId: string,
+    payload: {
+      signalType: 'unknownCredential' | 'allAcceptedCredentials' | 'currentUserDetails';
+      origin: string;
+      rpId?: string;
+      credentialId?: string;
+      userId?: string;
+      allAcceptedCredentialIds?: string[];
+      name?: string;
+      displayName?: string;
+    }
+  ): { updated: number; deleted: number } {
+    this.ensureUnsealedOrClearCaches();
+    const userId = sanitizeVaultUserId(rawUserId);
+    const { effectiveRpId } = validateRpIdForOrigin(payload.rpId, payload.origin);
+    const isValidB64Url = (val: unknown): val is string =>
+      typeof val === 'string' &&
+      val.length > 0 &&
+      val.length % 4 !== 1 &&
+      /^[A-Za-z0-9_-]+$/.test(val);
+
+    const userMap = this.getHydratedPasskeys(rawToken, userId);
+    let updated = 0;
+    let deleted = 0;
+
+    if (payload.signalType === 'unknownCredential') {
+      if (!isValidB64Url(payload.credentialId)) {
+        throw new Error('TypeError: Invalid base64url credentialId for signalUnknownCredential');
+      }
+      for (const [secretPath, { record }] of Array.from(userMap.entries())) {
+        if (record.rpId.toLowerCase() === effectiveRpId && record.credentialId === payload.credentialId) {
+          this.engine.deleteSecret(rawToken, secretPath);
+          userMap.delete(secretPath);
+          deleted++;
+        }
+      }
+      return { updated, deleted };
+    }
+
+    if (payload.signalType === 'allAcceptedCredentials') {
+      if (
+        !isValidB64Url(payload.userId) ||
+        !Array.isArray(payload.allAcceptedCredentialIds) ||
+        !payload.allAcceptedCredentialIds.every(isValidB64Url)
+      ) {
+        throw new Error(
+          'TypeError: Invalid base64url userId or allAcceptedCredentialIds for signalAllAcceptedCredentials'
+        );
+      }
+      const acceptedSet = new Set(payload.allAcceptedCredentialIds);
+      for (const [secretPath, { record }] of Array.from(userMap.entries())) {
+        if (
+          record.rpId.toLowerCase() === effectiveRpId &&
+          record.userHandleBase64Url === payload.userId &&
+          !acceptedSet.has(record.credentialId)
+        ) {
+          this.engine.deleteSecret(rawToken, secretPath);
+          userMap.delete(secretPath);
+          deleted++;
+        }
+      }
+      return { updated, deleted };
+    }
+
+    if (payload.signalType === 'currentUserDetails') {
+      if (!isValidB64Url(payload.userId)) {
+        throw new Error('TypeError: Invalid base64url userId for signalCurrentUserDetails');
+      }
+      const nowIso = new Date().toISOString();
+      for (const [secretPath, { record }] of Array.from(userMap.entries())) {
+        if (record.rpId.toLowerCase() === effectiveRpId && record.userHandleBase64Url === payload.userId) {
+          const nextRec: StoredPasskeyRecord = {
+            ...record,
+            ...(typeof payload.name === 'string' && payload.name.trim()
+              ? { userName: payload.name.trim() }
+              : {}),
+            ...(typeof payload.displayName === 'string' && payload.displayName.trim()
+              ? { userDisplayName: payload.displayName.trim() }
+              : {}),
+            updatedAt: nowIso
+          };
+          const meta = this.engine.putSecret(
+            rawToken,
+            secretPath,
+            nextRec as unknown as Record<string, unknown>,
+            { merge: false, skipIfUnchanged: true, maxVersions: 5 }
+          );
+          userMap.set(secretPath, { version: meta.version, record: nextRec });
+          updated++;
+        }
+      }
+      return { updated, deleted };
+    }
+
+    throw new Error(`Unsupported WebAuthn signalType: ${String(payload.signalType)}`);
+  }
 }

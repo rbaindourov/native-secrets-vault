@@ -407,4 +407,139 @@ describe('WebAuthn / FIDO2 Synced Passkeys (Transit Key Isolation + RP Verificat
     const auditVerify = await httpJson(port, 'GET', '/api/v1/audit/verify');
     expect(auditVerify.body.valid).toBe(true);
   });
+
+  it('supports RS256 (-257) RSA-only Relying Parties, WebAuthn Signal API sync, and rejects malformed Base64URL or cross-origin Signal calls (negative controls)', async () => {
+    const rsaChallenge = toBase64Url(crypto.randomBytes(32));
+    const rsaUserHandle = toBase64Url(Buffer.from('rsa_uid_999', 'utf8'));
+
+    // 1. Register RSA-only (-257) passkey
+    const regRsa = await httpJson(
+      port,
+      'POST',
+      '/api/v1/browser/alice_ws/passkeys/register',
+      {
+        origin: 'https://enterprise.example.com',
+        rpId: 'example.com',
+        rpName: 'Enterprise Portal',
+        userHandleBase64Url: rsaUserHandle,
+        userName: 'alice@example.com',
+        userDisplayName: 'Alice OldName',
+        challengeBase64Url: rsaChallenge,
+        pubKeyCredParams: [{ type: 'public-key', alg: -257 }]
+      },
+      aliceToken
+    );
+    expect(regRsa.status).toBe(201);
+    expect(regRsa.body.credential.publicKeyAlgorithm).toBe(-257);
+
+    // Verify RS256 assertion signature using exported SPKI public key
+    const authChallenge = toBase64Url(crypto.randomBytes(32));
+    const authRsa = await httpJson(
+      port,
+      'POST',
+      '/api/v1/browser/alice_ws/passkeys/authenticate',
+      {
+        origin: 'https://login.example.com',
+        rpId: 'example.com',
+        credentialId: regRsa.body.credential.id,
+        challengeBase64Url: authChallenge
+      },
+      aliceToken
+    );
+    expect(authRsa.status).toBe(200);
+
+    const spkiKey = crypto.createPublicKey({
+      key: fromBase64Url(regRsa.body.credential.publicKeySpkiBase64Url),
+      format: 'der',
+      type: 'spki'
+    });
+    const authData = fromBase64Url(authRsa.body.assertion.authenticatorDataBase64Url);
+    const clientDataHash = crypto
+      .createHash('sha256')
+      .update(fromBase64Url(authRsa.body.assertion.clientDataJSONBase64Url))
+      .digest();
+    const isValidRsa = crypto.verify(
+      'sha256',
+      Buffer.concat([authData, clientDataHash]),
+      spkiKey,
+      fromBase64Url(authRsa.body.assertion.signatureBase64Url)
+    );
+    expect(isValidRsa).toBe(true);
+
+    // 2. Negative control: Signal API rejects human-readable non-Base64URL IDs (`length % 4 === 1` or invalid chars)
+    const badSignal = await httpJson(
+      port,
+      'POST',
+      '/api/v1/browser/alice_ws/passkeys/signal',
+      {
+        signalType: 'unknownCredential',
+        origin: 'https://login.example.com',
+        rpId: 'example.com',
+        credentialId: 'not:valid:base64url='
+      },
+      aliceToken
+    );
+    expect(badSignal.status).toBe(400);
+    expect(badSignal.body.errors[0]).toContain('Invalid base64url');
+
+    // 3. Negative control: Cross-origin Signal API spoof rejected
+    const crossOriginSignal = await httpJson(
+      port,
+      'POST',
+      '/api/v1/browser/alice_ws/passkeys/signal',
+      {
+        signalType: 'unknownCredential',
+        origin: 'https://attacker.org',
+        rpId: 'example.com',
+        credentialId: regRsa.body.credential.id
+      },
+      aliceToken
+    );
+    expect(crossOriginSignal.status).toBe(400);
+    expect(crossOriginSignal.body.errors[0]).toContain('SecurityError:');
+
+    // 4. Positive Signal API: signalCurrentUserDetails updates userName/userDisplayName
+    const updateDetails = await httpJson(
+      port,
+      'POST',
+      '/api/v1/browser/alice_ws/passkeys/signal',
+      {
+        signalType: 'currentUserDetails',
+        origin: 'https://accounts.example.com',
+        rpId: 'example.com',
+        userId: rsaUserHandle,
+        name: 'alice.renamed@example.com',
+        displayName: 'Alice Renamed'
+      },
+      aliceToken
+    );
+    expect(updateDetails.status).toBe(200);
+    expect(updateDetails.body.updated).toBe(1);
+
+    const listedAfterRename = await httpJson(
+      port,
+      'GET',
+      '/api/v1/browser/alice_ws/passkeys?rpId=example.com',
+      undefined,
+      aliceToken
+    );
+    expect(listedAfterRename.body.passkeys[0].userName).toBe('alice.renamed@example.com');
+    expect(listedAfterRename.body.passkeys[0].userDisplayName).toBe('Alice Renamed');
+
+    // 5. Positive Signal API: signalUnknownCredential prunes orphaned passkey
+    const pruneOrphan = await httpJson(
+      port,
+      'POST',
+      '/api/v1/browser/alice_ws/passkeys/signal',
+      {
+        signalType: 'unknownCredential',
+        origin: 'https://accounts.example.com',
+        rpId: 'example.com',
+        credentialId: regRsa.body.credential.id
+      },
+      aliceToken
+    );
+    expect(pruneOrphan.status).toBe(200);
+    expect(pruneOrphan.body.deleted).toBe(1);
+  });
 });

@@ -687,12 +687,31 @@ export function createVaultServer(options: VaultServerOptions = {}) {
           return;
         }
 
-        const passkeyDeleteMatch = subRoute.match(/^passkeys\/([^/]+)$/);
-        if (passkeyDeleteMatch && method === 'DELETE') {
+        if (subRoute === 'passkeys/signal' && method === 'POST') {
+          const body = await readJsonBody(req);
+          const signaled = browserVault.signalPasskeys(token, userId, body as any);
+          sendJson(res, 200, { ok: true, ...signaled });
+          return;
+        }
+
+        const passkeyItemMatch = subRoute.match(/^passkeys\/([^/]+)$/);
+        if (passkeyItemMatch && method === 'PUT') {
+          const body = await readJsonBody(req);
+          const passkey = browserVault.updatePasskey(
+            token,
+            userId,
+            decodeURIComponent(passkeyItemMatch[1]),
+            body as any
+          );
+          sendJson(res, 200, { ok: true, passkey });
+          return;
+        }
+
+        if (passkeyItemMatch && method === 'DELETE') {
           const deleted = browserVault.deletePasskey(
             token,
             userId,
-            decodeURIComponent(passkeyDeleteMatch[1])
+            decodeURIComponent(passkeyItemMatch[1])
           );
           sendJson(res, 200, { ok: true, ...deleted });
           return;
